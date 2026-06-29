@@ -40,23 +40,61 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release
-cmake --build cpp/build --config Release -j
+# Build whichever impl this host has a toolchain for. C++ is the production
+# binary and is tried first; Go and Rust are conformance-equal fallbacks for
+# hosts without a C++ toolchain (e.g. SteamOS's immutable root, where there is
+# no cmake/cc at all but a user-local `go` works). Each builder writes its tool
+# output to stderr and prints ONLY the resulting binary path to stdout, so the
+# caller can capture the path via command substitution; a non-zero return means
+# "toolchain absent or build failed, try the next one".
+build_cpp() {
+    command -v cmake >/dev/null 2>&1 || return 1
+    cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release >&2 || return 1
+    cmake --build cpp/build --config Release -j >&2 || return 1
+    # Check .exe variants first because git-bash on Windows resolves
+    # `[[ -f "walker" ]]` true for an existing `walker.exe`, which would land us
+    # on the wrong candidate string and skip the case-based suffix below.
+    local candidate
+    for candidate in cpp/build/Release/walker.exe cpp/build/walker.exe cpp/build/Release/walker cpp/build/walker; do
+        if [[ -f "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
 
-# Locate the binary across single-config (Make/Ninja: build/walker) and
-# multi-config (VS: build/Release/walker.exe) generators. Check .exe
-# variants first because git-bash on Windows resolves `[[ -f "walker" ]]`
-# true for an existing `walker.exe`, which would land us on the wrong
-# candidate string and skip the case-based suffix below.
+build_go() {
+    command -v go >/dev/null 2>&1 || return 1
+    # CGO off so the pure-Go linker is used -- no system `cc` required.
+    ( cd go && CGO_ENABLED=0 go build -o walker . ) >&2 || return 1
+    [[ -f go/walker ]] && { printf '%s\n' "go/walker"; return 0; }
+    return 1
+}
+
+build_rust() {
+    command -v cargo >/dev/null 2>&1 || return 1
+    # rustc shells out to a system linker; skip if there is no C compiler.
+    command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1 \
+        || command -v clang >/dev/null 2>&1 || return 1
+    ( cd rust && cargo build --release ) >&2 || return 1
+    [[ -f rust/target/release/walker ]] && {
+        printf '%s\n' "rust/target/release/walker"
+        return 0
+    }
+    return 1
+}
+
 walker_bin=""
-for candidate in cpp/build/Release/walker.exe cpp/build/walker.exe cpp/build/Release/walker cpp/build/walker; do
-    if [[ -f "$candidate" ]]; then
-        walker_bin="$candidate"
+for builder in build_cpp build_go build_rust; do
+    if walker_bin="$("$builder")"; then
+        echo "built walker via ${builder#build_}: $walker_bin" >&2
         break
     fi
 done
 if [[ -z "$walker_bin" ]]; then
-    echo "install.sh: built walker binary not found under cpp/build/" >&2
+    echo "install.sh: no usable toolchain to build the walker." >&2
+    echo "            install one of: cmake + a C++ compiler, or go, or cargo + cc." >&2
     exit 1
 fi
 
