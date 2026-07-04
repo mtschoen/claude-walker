@@ -43,3 +43,7 @@ __pycache__/
 mcp/.venv/
 
 .maintenance.json
+
+# aislop runtime artifacts (session log, caches) — keep only the config.
+.aislop/*
+!.aislop/config.yml
