@@ -38,6 +38,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from process_safe import ProcessResult, run_captured
+
 ROOT = Path(__file__).resolve().parent.parent
 RUST_DIR = ROOT / "rust"
 CPP_DIR = ROOT / "cpp"
@@ -75,10 +77,19 @@ class Result:
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-def run(cmd, *, cwd=None, env=None, check=True, capture=True) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        cmd, cwd=cwd, env=env, check=check,
-        capture_output=capture, text=True, encoding="utf-8",
+# Backstop, not a tight budget: builds (cargo/cmake/zig) and the conformance
+# harness they chain into can legitimately run for minutes. This only exists
+# so a genuine hang (e.g. a wedged walker subprocess inside conformance.py's
+# own run_captured calls, or a stuck compiler) fails in a bounded time instead
+# of wedging the coverage run forever.
+DEFAULT_RUN_TIMEOUT_SECONDS = 1800
+
+
+def run(cmd, *, cwd=None, env=None, check=True, capture=True,
+        timeout=DEFAULT_RUN_TIMEOUT_SECONDS) -> ProcessResult:
+    assert capture, "coverage.run() only supports capture=True (no caller passes False)"
+    return run_captured(
+        cmd, cwd=cwd, env=env, check=check, timeout=timeout, encoding="utf-8",
     )
 
 

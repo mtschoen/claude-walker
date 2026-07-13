@@ -26,11 +26,12 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
 from typing import Literal, overload
+
+from process_safe import ProcessResult, run_captured
 
 ROOT = Path(__file__).resolve().parent.parent
 CORPUS = ROOT / "shared" / "corpus"
@@ -110,7 +111,7 @@ def run_walker(lang: str, binary: Path, meta: dict, projects_root: Path, extras:
     ]
     for extra in extras or []:
         cmd.extend(["--extra-projects-root", str(extra)])
-    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=10)
+    result = run_captured(cmd, text=True, encoding="utf-8", timeout=10)
     if result.returncode != 0:
         raise RuntimeError(
             f"{binary.name} exited {result.returncode}\n"
@@ -182,7 +183,7 @@ def check_implementation(lang: str, binary: Path, expected: dict) -> bool:
 def run_walker_subcommand(lang: str, binary: Path, subcommand: str, args: list[str]) -> dict:
     """Invoke a walker subcommand, return parsed JSON of last stdout line."""
     cmd = [str(binary), subcommand, *args, "--no-config"]
-    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=10)
+    result = run_captured(cmd, text=True, encoding="utf-8", timeout=10)
     if result.returncode != 0:
         raise RuntimeError(
             f"{binary.name} {subcommand} exited {result.returncode}\n"
@@ -356,7 +357,7 @@ def run_walker_search(
     for extra in extras or []:
         cmd.extend(["--extra-projects-root", str(extra)])
     cmd.extend(flags)
-    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=10)
+    result = run_captured(cmd, text=True, encoding="utf-8", timeout=10)
     if result.returncode != 0:
         raise RuntimeError(
             f"{binary.name} search exited {result.returncode}\n"
@@ -473,7 +474,7 @@ def run_walker_search_pretty(
         "--no-config",
     ]
     cmd.extend(flags)
-    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=10)
+    result = run_captured(cmd, text=True, encoding="utf-8", timeout=10)
     return result.returncode, result.stdout, result.stderr
 
 
@@ -680,7 +681,7 @@ def assert_search_truncated(lang: str, binary: Path) -> bool:
             "--no-config",
             "--limit", "1",
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=10)
+        result = run_captured(cmd, text=True, encoding="utf-8", timeout=10)
     if result.returncode != 0:
         print(f"  [{lang:>4s}] {label:48s} FAIL  jsonl exit={result.returncode} stderr={result.stderr!r}")
         return False
@@ -921,7 +922,7 @@ def check_events(lang: str, binary: Path) -> bool:
             "--now", repr(pin_now),
             "--no-config",
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=10)
+        result = run_captured(cmd, text=True, encoding="utf-8", timeout=10)
         if result.returncode != 0:
             print(
                 f"  [{lang:>4s}] {label:30s} FAIL  "
@@ -1019,7 +1020,7 @@ def check_empty_root(lang: str, binary: Path, expected: dict) -> bool:
                "--period", str(meta["period_seconds"]),
                "--win-start", repr(meta["win_start_unix"]),
                *common_args]
-        result = subprocess.run(cmd, capture_output=True, text=True,
+        result = run_captured(cmd, text=True,
                                 encoding="utf-8", timeout=10)
         cost_ok = result.returncode == 0
         if cost_ok:
@@ -1043,7 +1044,7 @@ def check_empty_root(lang: str, binary: Path, expected: dict) -> bool:
                "--period", str(meta["period_seconds"]),
                "--win-start", repr(meta["win_start_unix"]),
                *common_args]
-        result = subprocess.run(cmd, capture_output=True, text=True,
+        result = run_captured(cmd, text=True,
                                 encoding="utf-8", timeout=10)
         # events allows empty stdout per SPEC §events ("Exit 0 even when
         # the output stream is empty.").
@@ -1060,7 +1061,7 @@ def check_empty_root(lang: str, binary: Path, expected: dict) -> bool:
         cmd = [str(binary), "beacons-latest",
                "--session-id", "no-such-session",
                *common_args]
-        result = subprocess.run(cmd, capture_output=True, text=True,
+        result = run_captured(cmd, text=True,
                                 encoding="utf-8", timeout=10)
         bl_ok = result.returncode == 0
         if bl_ok:
@@ -1081,7 +1082,7 @@ def check_empty_root(lang: str, binary: Path, expected: dict) -> bool:
                "--period", str(meta["period_seconds"]),
                "--win-start", repr(meta["win_start_unix"]),
                *common_args]
-        result = subprocess.run(cmd, capture_output=True, text=True,
+        result = run_captured(cmd, text=True,
                                 encoding="utf-8", timeout=10)
         bh_ok = result.returncode == 0
         if bh_ok:
@@ -1105,7 +1106,7 @@ def check_empty_root(lang: str, binary: Path, expected: dict) -> bool:
             cmd = [str(binary), "search", "pattern",
                    "--format", "jsonl",
                    *common_args]
-            result = subprocess.run(cmd, capture_output=True, text=True,
+            result = run_captured(cmd, text=True,
                                     encoding="utf-8", timeout=10)
             search_ok = result.returncode == 0
             hits_count = 0
@@ -1152,10 +1153,10 @@ def check_help(lang: str, binary: Path) -> bool:
     ]
     all_ok = True
 
-    def run(args: list[str]) -> subprocess.CompletedProcess:
-        return subprocess.run(
+    def run(args: list[str]) -> ProcessResult:
+        return run_captured(
             [str(binary), *args],
-            capture_output=True, text=True, encoding="utf-8", timeout=10,
+            text=True, encoding="utf-8", timeout=10,
         )
 
     # 1. --help: exit 0, overview on stdout with every subcommand + --period.
@@ -1213,10 +1214,10 @@ def check_cli_argument_matrix(lang: str, binary: Path) -> bool:
     """
     all_ok = True
 
-    def run(args: list[str]) -> subprocess.CompletedProcess:
-        return subprocess.run(
+    def run(args: list[str]) -> ProcessResult:
+        return run_captured(
             [str(binary), *args],
-            capture_output=True, text=True, encoding="utf-8", timeout=10,
+            text=True, encoding="utf-8", timeout=10,
         )
 
     # (label, args, expected_exit, stderr_must_contain_or_None)
@@ -1477,9 +1478,9 @@ def check_omit_now_smoke(lang: str, binary: Path) -> bool:
                         "--format", "jsonl"]),
         ]
         for label, args in cases:
-            result = subprocess.run(
+            result = run_captured(
                 [str(binary), *args],
-                capture_output=True, text=True, encoding="utf-8", timeout=10,
+                text=True, encoding="utf-8", timeout=10,
             )
             ok = result.returncode == 0
             badge = " OK " if ok else "FAIL"
@@ -1520,8 +1521,8 @@ def run_walker_env(
     ]
     if projects_root is not None:
         cmd.extend(["--projects-root", str(projects_root)])
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, encoding="utf-8", timeout=10, env=env
+    result = run_captured(
+        cmd, text=True, encoding="utf-8", timeout=10, env=env
     )
     if result.returncode != 0:
         raise RuntimeError(
@@ -1718,7 +1719,7 @@ def check_cost_subcommand(lang: str, binary: Path, expected: dict) -> bool:
             "--projects-root", tmp,
             "--no-config",
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True,
+        result = run_captured(cmd, text=True,
                                 encoding="utf-8", timeout=10)
     ok = result.returncode == 0
     got: dict = {}
@@ -1856,7 +1857,7 @@ def check_events_extra_root_profile(lang: str, binary: Path) -> bool:
             "--now", repr(expected_data["pin_now"]),
             "--no-config",
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True,
+        result = run_captured(cmd, text=True,
                                 encoding="utf-8", timeout=10, env=env)
     ok = result.returncode == 0
     got_records: list[dict] = []
@@ -1908,7 +1909,7 @@ def check_search_cpuprofile(lang: str, binary: Path) -> bool:
             "--no-config",
             *combo["flags"],
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True,
+        result = run_captured(cmd, text=True,
                                 encoding="utf-8", timeout=10, env=env)
     ok = result.returncode == 0
     hits = []
@@ -2322,7 +2323,7 @@ def check_search_tool_blocks_rich(lang: str, binary: Path) -> bool:
                 "--no-config",
                 *flags,
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True,
+            result = run_captured(cmd, text=True,
                                     encoding="utf-8", timeout=10)
             ok = result.returncode == 0
             hits = []
@@ -2365,7 +2366,7 @@ def check_search_tool_blocks_rich(lang: str, binary: Path) -> bool:
                 "--include-tool-blocks",
                 "--snippet-chars", "600",
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True,
+            result = run_captured(cmd, text=True,
                                     encoding="utf-8", timeout=10)
             ok = result.returncode == 0
             hits = []
@@ -2426,8 +2427,8 @@ def check_home_fallbacks(lang: str, binary: Path, expected: dict) -> bool:
                 fallback = "HOME" if sys.platform == "win32" else "USERPROFILE"
                 env[fallback] = str(home_p)
             try:
-                result = subprocess.run(
-                    base_cmd, capture_output=True, text=True, encoding="utf-8",
+                result = run_captured(
+                    base_cmd, text=True, encoding="utf-8",
                     timeout=10, env=env, cwd=str(home_p) if use_cwd else None,
                 )
                 got = json.loads(result.stdout.strip().splitlines()[-1])
@@ -2436,8 +2437,8 @@ def check_home_fallbacks(lang: str, binary: Path, expected: dict) -> bool:
                 # Same fallback resolution through the events subcommand's
                 # default-root path: exit 0 with records on stdout.
                 ev_cmd = [str(binary), "events", *base_cmd[1:]]
-                ev = subprocess.run(
-                    ev_cmd, capture_output=True, text=True, encoding="utf-8",
+                ev = run_captured(
+                    ev_cmd, text=True, encoding="utf-8",
                     timeout=10, env=env, cwd=str(home_p) if use_cwd else None,
                 )
                 ok = ok and ev.returncode == 0 and ev.stdout.strip() != ""

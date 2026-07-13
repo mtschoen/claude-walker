@@ -1,0 +1,27 @@
+# Minimal ruff config for agent-walker's Python surface (mcp/, shared/).
+# This repo has no pre-existing lint baseline (it's primarily Rust/C++/Go/Zig
+# with a thin Python layer; AGENTS.md says "No lint gate in CI yet"). This
+# file adds ONLY the TID251 raw-subprocess ban.
+#
+# `select = ["TID251"]` rather than `extend-select`: with no prior config,
+# ruff's *implicit* select defaults to ["E4", "E7", "E9", "F"], so
+# extend-select would silently turn that default set into an enforced gate
+# too and surface pre-existing, unrelated findings (E402/F541/F401 -- none
+# touching subprocess). An explicit `select` naming only TID251 is what
+# actually keeps this repo's lint surface at "just the subprocess ban", per
+# the ask not to impose a broader baseline here.
+
+[lint]
+select = ["TID251"]
+
+[lint.flake8-tidy-imports.banned-api]
+"subprocess.run".msg = "Use process_safe.run_captured / run_inherit. Raw subprocess.run(capture_output=True, timeout=...) can hang forever on Windows when a grandchild inherits the pipe (bpo-31935). See shared/process_safe.py."
+"subprocess.Popen".msg = "Use process_safe.run_captured / spawn_detached. See shared/process_safe.py."
+"subprocess.call".msg = "Use process_safe.run_inherit. See shared/process_safe.py."
+"subprocess.check_call".msg = "Use process_safe.run_inherit. See shared/process_safe.py."
+"subprocess.check_output".msg = "Use process_safe.run_captured. See shared/process_safe.py."
+
+[lint.per-file-ignores]
+# The sanctioned subprocess home (see its module docstring) -- TID251 exists
+# to force everything else through it.
+"shared/process_safe.py" = ["TID251"]

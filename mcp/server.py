@@ -19,14 +19,23 @@ import functools
 import json
 import os
 import shutil
-import subprocess
+import sys
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal
 
+# shared/ is a sibling of this file's parent (repo layout: <repo>/mcp/server.py,
+# <repo>/shared/process_safe.py); it is NOT on sys.path[0] the way `shared/`
+# scripts get it for free, since this file's own directory (`mcp/`) is what
+# lands there when launched by absolute path (see the module docstring above).
+_SHARED_DIR = Path(__file__).resolve().parent.parent / "shared"
+if str(_SHARED_DIR) not in sys.path:
+    sys.path.insert(0, str(_SHARED_DIR))
+
 from mcp.server.fastmcp import FastMCP
+from process_safe import ProcessTimeout, run_captured
 
 # Per-process request log, mirroring projdash's pattern: one JSON line per
 # event (session_start / call / return / error). Tail it to diagnose a hung
@@ -144,18 +153,24 @@ def _run_search(arguments: list[str]) -> dict[str, Any]:
     `note` carries the walker's stderr (e.g. the truncation hint) on success.
     Raises RuntimeError on a non-zero exit (bad pattern / regex / time / flag)
     or a subprocess timeout — FastMCP surfaces it as an MCP tool error.
+
+    Shells out via process_safe.run_captured rather than bare subprocess.run:
+    this is the live MCP server behind claude_walker_search, so a wedged
+    child (e.g. a grandchild process inheriting the stdout pipe on Windows,
+    bpo-31935) would stall the whole stdio connection, not just one call.
+    run_captured's abandon-reader-thread pattern guarantees the timeout below
+    is a hard wall clock even in that case.
     """
     binary = _resolve_binary()
     command = [str(binary), "search", *arguments, "--format", "jsonl"]
     try:
-        completed = subprocess.run(
+        completed = run_captured(
             command,
-            capture_output=True,
             encoding="utf-8",
             errors="replace",
             timeout=SUBPROCESS_TIMEOUT_SECONDS,
         )
-    except subprocess.TimeoutExpired as error:
+    except ProcessTimeout as error:
         raise RuntimeError(
             f"walker search timed out after {SUBPROCESS_TIMEOUT_SECONDS}s — a configured "
             f"root may be unreachable. Command: {' '.join(command)}"

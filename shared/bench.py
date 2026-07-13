@@ -42,6 +42,8 @@ import sys
 import time
 from pathlib import Path
 
+from process_safe import run_captured, run_inherit
+
 ROOT = Path(__file__).resolve().parent.parent
 HOME = Path(os.path.expanduser("~"))
 DEFAULT_CORPUS = ROOT / "shared" / "corpus-perf"
@@ -94,7 +96,9 @@ def ensure_corpus(corpus_dir: Path, target_mb: float, regen: bool) -> dict:
         ]
         if regen:
             cmd.append("--force")
-        subprocess.run(cmd, check=True)
+        rc = run_inherit(cmd)
+        if rc != 0:
+            raise subprocess.CalledProcessError(rc, cmd)
     return json.loads(manifest_path.read_text(encoding="utf-8"))
 
 
@@ -182,7 +186,7 @@ def build_cmd(binary: Path, mode: str, ctx: dict) -> list:
 def run_once(cmd: list):
     """One timed invocation. Returns (wall_ms, stdout, err)."""
     t0 = time.perf_counter()
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    result = run_captured(cmd, timeout=60)
     wall = (time.perf_counter() - t0) * 1000
     if result.returncode != 0:
         return None, None, result.stderr
