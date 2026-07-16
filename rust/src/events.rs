@@ -179,7 +179,7 @@ fn walk_group_events(
 
             let usage = msg.usage.unwrap_or_default();
             let model = msg.model.unwrap_or_default().to_ascii_lowercase();
-            let usd = cost_for(&usage, &model);
+            let usd = cost_for(&usage, &model, &ts_str);
 
             records.push(EventRecord {
                 ts,

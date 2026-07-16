@@ -194,17 +194,34 @@ Within each surviving file, accept a line iff:
 ## Pricing
 
 Per-MTok input/output rates by family (substring match on lowercased
-model id):
+model id). The match is ordered — the **first** family whose needle is a
+substring of the lowercased model id wins:
 
-| Family | Input | Output |
-| ------ | ----- | ------ |
-| opus   | 5.0   | 25.0   |
-| sonnet | 3.0   | 15.0   |
-| haiku  | 1.0   | 5.0    |
+| Order | Family                     | Needle(s)          | Input | Output |
+| ----- | -------------------------- | ------------------ | ----- | ------ |
+| 1     | fable / mythos             | `fable`, `mythos`  | 10.0  | 50.0   |
+| 2     | opus                       | `opus`             | 5.0   | 25.0   |
+| 3     | haiku                      | `haiku`            | 1.0   | 5.0    |
+| 4     | sonnet-5 (date-aware)      | `sonnet-5`         | 2.0/3.0 | 10.0/15.0 |
+| 5     | sonnet / unknown (default) | —                  | 3.0   | 15.0   |
 
 - `cache_read = input_rate × 0.10`
 - `cache_write = input_rate × 1.25`
-- Unknown family falls back to **sonnet** rates (matches Python).
+- **Match order is load-bearing:** `fable`/`mythos` are checked first, and
+  `sonnet-5` is checked *before* the generic sonnet default. The `sonnet-5`
+  needle does **not** match `claude-sonnet-4-5` (the substring `sonnet-5` is
+  absent there — `sonnet-4-5` contains `sonnet-4` and a trailing `-5`, not
+  `sonnet-5`), so Sonnet 4.5 correctly prices at the generic sonnet default.
+- **Sonnet 5 is date-aware.** Introductory pricing **$2.00 / $10.00** applies
+  to turns timestamped through **2026-08-31** inclusive; standard pricing
+  **$3.00 / $15.00** applies from **2026-09-01** onward. The selection is a
+  lexicographic comparison of the ISO-8601 timestamp's 10-char date prefix
+  (`YYYY-MM-DD`) against `"2026-09-01"`: `prefix >= "2026-09-01"` → standard,
+  else intro. This is monotonic for zero-padded dates and avoids timezone
+  normalization (a turn's own recorded local date decides its rate). All four
+  impls and the Python reference thread the entry's `timestamp` into the rate
+  lookup for this; no other family consults the timestamp.
+- Unknown family falls back to **sonnet** default rates (matches Python).
 - Opus 1M-tier doubling is **not** applied here — the harness does not apply it
   in practice (measured 0% error vs authoritative `costUSD` on big-context Opus,
   incl. 26M-cache-read sessions), so token rates alone match.

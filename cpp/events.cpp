@@ -308,7 +308,8 @@ walk_group_events(const std::vector<fs::path> &paths, const std::string &slug,
         continue;
 
       double usd = cost_for(input_tokens, output_tokens, cache_read_tokens,
-                            cache_write_tokens, web_search_requests, model);
+                            cache_write_tokens, web_search_requests, model,
+                            timestamp_view);
 
       records.push_back(EventRecord{ts, usd, model, session_id, slug});
     }

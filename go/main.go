@@ -289,14 +289,35 @@ func (s *serverToolUse) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+// sonnet5StandardFrom is the intro->standard boundary for Sonnet 5. Intro
+// pricing runs through 2026-08-31 inclusive; standard applies from 2026-09-01
+// onward. Selection is a lexicographic compare of the turn's ISO-8601 date
+// prefix ("YYYY-MM-DD") against this string — monotonic for zero-padded dates,
+// no timezone math.
+const sonnet5StandardFrom = "2026-09-01"
+
 // ratesForModel returns (inputPerMTok, outputPerMTok) for a model string.
-func ratesForModel(model string) (float64, float64) {
+// datePrefix is the turn's ISO-8601 timestamp (only its leading 10-char
+// "YYYY-MM-DD" is consulted, and only for the sonnet-5 family).
+func ratesForModel(model, datePrefix string) (float64, float64) {
 	lower := strings.ToLower(model)
 	switch {
+	// fable/mythos first: the Fable family bills at $10/$50 and must win
+	// before any substring that could collide.
+	case strings.Contains(lower, "fable"), strings.Contains(lower, "mythos"):
+		return 10.0, 50.0
 	case strings.Contains(lower, "opus"):
 		return 5.0, 25.0
 	case strings.Contains(lower, "haiku"):
 		return 1.0, 5.0
+	// sonnet-5 BEFORE the generic sonnet default. "sonnet-5" does NOT match
+	// "claude-sonnet-4-5" (no such substring), so Sonnet 4.5 keeps the
+	// generic sonnet rates below, date-independent.
+	case strings.Contains(lower, "sonnet-5"):
+		if len(datePrefix) >= 10 && datePrefix[:10] >= sonnet5StandardFrom {
+			return 3.0, 15.0 // standard
+		}
+		return 2.0, 10.0 // intro
 	default: // sonnet or unknown -> sonnet
 		return 3.0, 15.0
 	}
@@ -306,12 +327,13 @@ func ratesForModel(model string) (float64, float64) {
 // (billed $10 / 1,000), added on top of token cost. Matches SPEC.md.
 const webSearchCostUSD = 0.01
 
-// costForTurn computes the dollar cost of one assistant turn.
-func costForTurn(u *usage, model string) float64 {
+// costForTurn computes the dollar cost of one assistant turn. datePrefix is
+// the turn's ISO-8601 timestamp, threaded through for date-aware sonnet-5.
+func costForTurn(u *usage, model, datePrefix string) float64 {
 	if u == nil {
 		return 0
 	}
-	inputRate, outputRate := ratesForModel(model)
+	inputRate, outputRate := ratesForModel(model, datePrefix)
 	tokenCost := (float64(u.InputTokens)*inputRate +
 		float64(u.CacheReadInputTokens)*inputRate*0.10 +
 		float64(u.CacheCreationInputTokens)*inputRate*1.25 +
@@ -402,7 +424,7 @@ func walkGroup(paths []string, periodCutoff, winStart float64) groupResult {
 				continue
 			}
 
-			cost := costForTurn(msg.Usage, string(msg.Model))
+			cost := costForTurn(msg.Usage, string(msg.Model), string(e.Timestamp))
 			if ts >= periodCutoff {
 				result.trailing += cost
 			}

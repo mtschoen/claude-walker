@@ -82,25 +82,51 @@ func TestParseFloat64(t *testing.T) {
 	}
 }
 
-// TestRatesForModel covers all three rate buckets.
+// TestRatesForModel covers every rate bucket, the fable/mythos family, the
+// date-aware sonnet-5 branch, and the sonnet-4-5 non-collision guard.
 func TestRatesForModel(t *testing.T) {
-	if in, out := ratesForModel("claude-3-opus"); in != 5.0 || out != 25.0 {
+	if in, out := ratesForModel("claude-3-opus", ""); in != 5.0 || out != 25.0 {
 		t.Errorf("opus rates = (%v,%v); want (5,25)", in, out)
 	}
-	if in, out := ratesForModel("HAIKU"); in != 1.0 || out != 5.0 {
+	if in, out := ratesForModel("HAIKU", ""); in != 1.0 || out != 5.0 {
 		t.Errorf("haiku rates = (%v,%v); want (1,5)", in, out)
 	}
-	if in, out := ratesForModel("claude-3-5-sonnet"); in != 3.0 || out != 15.0 {
+	if in, out := ratesForModel("claude-3-5-sonnet", ""); in != 3.0 || out != 15.0 {
 		t.Errorf("sonnet rates = (%v,%v); want (3,15)", in, out)
 	}
-	if in, out := ratesForModel("unknown-model"); in != 3.0 || out != 15.0 {
+	if in, out := ratesForModel("unknown-model", ""); in != 3.0 || out != 15.0 {
 		t.Errorf("unknown rates = (%v,%v); want (3,15)", in, out)
+	}
+	// Fable family ($10/$50), date-independent.
+	if in, out := ratesForModel("claude-fable-5", "2026-05-10"); in != 10.0 || out != 50.0 {
+		t.Errorf("fable rates = (%v,%v); want (10,50)", in, out)
+	}
+	if in, out := ratesForModel("claude-mythos-preview", ""); in != 10.0 || out != 50.0 {
+		t.Errorf("mythos rates = (%v,%v); want (10,50)", in, out)
+	}
+	// Sonnet 5: intro through 2026-08-31, standard from 2026-09-01.
+	if in, out := ratesForModel("claude-sonnet-5", "2026-05-10"); in != 2.0 || out != 10.0 {
+		t.Errorf("sonnet-5 intro rates = (%v,%v); want (2,10)", in, out)
+	}
+	if in, out := ratesForModel("claude-sonnet-5", "2026-08-31"); in != 2.0 || out != 10.0 {
+		t.Errorf("sonnet-5 2026-08-31 rates = (%v,%v); want (2,10)", in, out)
+	}
+	if in, out := ratesForModel("claude-sonnet-5", "2026-09-01"); in != 3.0 || out != 15.0 {
+		t.Errorf("sonnet-5 2026-09-01 rates = (%v,%v); want (3,15)", in, out)
+	}
+	if in, out := ratesForModel("claude-sonnet-5", ""); in != 2.0 || out != 10.0 {
+		t.Errorf("sonnet-5 no-date rates = (%v,%v); want intro (2,10)", in, out)
+	}
+	// Non-collision: sonnet-4-5 must NOT hit the sonnet-5 branch, stays $3/$15
+	// regardless of date.
+	if in, out := ratesForModel("claude-sonnet-4-5", "2026-09-15"); in != 3.0 || out != 15.0 {
+		t.Errorf("sonnet-4-5 rates = (%v,%v); want (3,15)", in, out)
 	}
 }
 
 // TestCostForTurnNilUsage — covers main.go:252-254 nil-usage early return.
 func TestCostForTurnNilUsage(t *testing.T) {
-	if c := costForTurn(nil, "sonnet"); c != 0 {
+	if c := costForTurn(nil, "sonnet", ""); c != 0 {
 		t.Fatalf("costForTurn(nil) = %v; want 0", c)
 	}
 }
@@ -108,7 +134,7 @@ func TestCostForTurnNilUsage(t *testing.T) {
 // TestCostForTurnWebSearchFee covers the web-search flat-fee path.
 func TestCostForTurnWebSearchFee(t *testing.T) {
 	u := &usage{ServerToolUse: &serverToolUse{WebSearchRequests: 5}}
-	got := costForTurn(u, "sonnet")
+	got := costForTurn(u, "sonnet", "")
 	if got != 0.05 {
 		t.Fatalf("costForTurn(web=5) = %v; want 0.05", got)
 	}
@@ -122,7 +148,7 @@ func TestCostForTurnTokenBreakdown(t *testing.T) {
 		CacheReadInputTokens:     10_000_000, // 10M * $3 * 0.10 = $3
 		CacheCreationInputTokens: 800_000,    // 800k * $3 * 1.25 = $3
 	}
-	got := costForTurn(u, "sonnet")
+	got := costForTurn(u, "sonnet", "")
 	want := 3.0 + 15.0 + 3.0 + 3.0
 	if got < want-1e-6 || got > want+1e-6 {
 		t.Fatalf("costForTurn breakdown = %v; want %v", got, want)

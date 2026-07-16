@@ -221,7 +221,7 @@ fn walk_group(paths: &[PathBuf], period_cutoff: f64, win_start_unix: f64) -> Gro
             }
             let usage = msg.usage.unwrap_or_default();
             let model = msg.model.unwrap_or_default();
-            let c = cost_for(&usage, &model);
+            let c = cost_for(&usage, &model, &ts_str);
             if ts >= period_cutoff {
                 trailing += c;
             }

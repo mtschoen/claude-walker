@@ -200,7 +200,8 @@ inline GroupResult walk_group(const std::vector<fs::path> &paths,
         continue;
 
       double cost = cost_for(input_tokens, output_tokens, cache_read_tokens,
-                             cache_write_tokens, web_search_requests, model);
+                             cache_write_tokens, web_search_requests, model,
+                             timestamp_view);
 
       if (ts >= period_cutoff)
         result.trailing += cost;

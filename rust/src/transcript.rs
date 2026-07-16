@@ -100,21 +100,42 @@ fn lenient_server_tool_use<'de, D: Deserializer<'de>>(d: D) -> Result<ServerTool
 /// added on top of token cost. Matches SPEC.md and the Python reference.
 pub(crate) const WEB_SEARCH_COST_USD: f64 = 0.01;
 
-/// (input_per_mtok, output_per_mtok). Matches SPEC.md exactly.
-pub(crate) fn rates_for(model: &str) -> (f64, f64) {
+/// Sonnet 5 intro->standard boundary. Intro pricing runs through 2026-08-31
+/// inclusive; standard applies from 2026-09-01 onward. Selection is a
+/// lexicographic compare of the turn's ISO-8601 date prefix ("YYYY-MM-DD")
+/// against this string — monotonic for zero-padded dates, no timezone math.
+pub(crate) const SONNET5_STANDARD_FROM: &str = "2026-09-01";
+
+/// (input_per_mtok, output_per_mtok). Matches SPEC.md exactly. `date_prefix`
+/// is the turn's ISO-8601 timestamp (only its leading 10-char "YYYY-MM-DD" is
+/// consulted, and only for the sonnet-5 family).
+pub(crate) fn rates_for(model: &str, date_prefix: &str) -> (f64, f64) {
     let m = model.to_ascii_lowercase();
-    if m.contains("opus") {
+    // fable/mythos first: the Fable family bills at $10/$50 and must win
+    // before any substring that could collide.
+    if m.contains("fable") || m.contains("mythos") {
+        (10.0, 50.0)
+    } else if m.contains("opus") {
         (5.0, 25.0)
     } else if m.contains("haiku") {
         (1.0, 5.0)
+    } else if m.contains("sonnet-5") {
+        // sonnet-5 BEFORE the generic sonnet default. "sonnet-5" does NOT
+        // match "claude-sonnet-4-5" (no such substring), so Sonnet 4.5 keeps
+        // the generic sonnet rates below, date-independent.
+        if date_prefix.len() >= 10 && &date_prefix[..10] >= SONNET5_STANDARD_FROM {
+            (3.0, 15.0) // standard
+        } else {
+            (2.0, 10.0) // intro
+        }
     } else {
         // sonnet — and any unknown model falls back to sonnet rates, per SPEC.md
         (3.0, 15.0)
     }
 }
 
-pub(crate) fn cost_for(usage: &Usage, model: &str) -> f64 {
-    let (i_rate, o_rate) = rates_for(model);
+pub(crate) fn cost_for(usage: &Usage, model: &str, date_prefix: &str) -> f64 {
+    let (i_rate, o_rate) = rates_for(model, date_prefix);
     let token_cost = (usage.input_tokens as f64 * i_rate
         + usage.cache_read_input_tokens as f64 * i_rate * 0.10
         + usage.cache_creation_input_tokens as f64 * i_rate * 1.25
@@ -244,11 +265,38 @@ mod tests {
 
     #[test]
     fn rates_for_opus_haiku_default() {
-        assert_eq!(rates_for("claude-3-opus-20240229"), (5.0, 25.0));
-        assert_eq!(rates_for("CLAUDE-OPUS-4-5"), (5.0, 25.0));
-        assert_eq!(rates_for("claude-3-5-haiku"), (1.0, 5.0));
-        assert_eq!(rates_for("claude-3-5-sonnet"), (3.0, 15.0));
-        assert_eq!(rates_for("unknown-model"), (3.0, 15.0));
+        assert_eq!(rates_for("claude-3-opus-20240229", ""), (5.0, 25.0));
+        assert_eq!(rates_for("CLAUDE-OPUS-4-5", ""), (5.0, 25.0));
+        assert_eq!(rates_for("claude-3-5-haiku", ""), (1.0, 5.0));
+        assert_eq!(rates_for("claude-3-5-sonnet", ""), (3.0, 15.0));
+        assert_eq!(rates_for("unknown-model", ""), (3.0, 15.0));
+    }
+
+    #[test]
+    fn rates_for_fable_mythos() {
+        // Fable family: $10/$50, date-independent.
+        assert_eq!(rates_for("claude-fable-5", "2026-05-10"), (10.0, 50.0));
+        assert_eq!(rates_for("CLAUDE-FABLE-5", "2026-12-31"), (10.0, 50.0));
+        assert_eq!(rates_for("claude-mythos-preview", ""), (10.0, 50.0));
+    }
+
+    #[test]
+    fn rates_for_sonnet5_date_aware() {
+        // Intro through 2026-08-31 inclusive; standard from 2026-09-01.
+        assert_eq!(rates_for("claude-sonnet-5", "2026-05-10"), (2.0, 10.0));
+        assert_eq!(rates_for("claude-sonnet-5", "2026-08-31"), (2.0, 10.0));
+        assert_eq!(rates_for("claude-sonnet-5", "2026-09-01"), (3.0, 15.0));
+        assert_eq!(rates_for("claude-sonnet-5", "2026-09-15"), (3.0, 15.0));
+        // Missing/short date prefix defaults to intro.
+        assert_eq!(rates_for("claude-sonnet-5", ""), (2.0, 10.0));
+    }
+
+    #[test]
+    fn rates_for_sonnet45_not_sonnet5() {
+        // "sonnet-4-5" does NOT contain the "sonnet-5" substring -> generic
+        // sonnet rates ($3/$15), date-independent (must not intro-price).
+        assert_eq!(rates_for("claude-sonnet-4-5", "2026-05-10"), (3.0, 15.0));
+        assert_eq!(rates_for("claude-sonnet-4-5", "2026-09-15"), (3.0, 15.0));
     }
 
     #[test]
@@ -263,7 +311,7 @@ mod tests {
             },
         };
         // 3 * $0.01 = $0.03, no token cost.
-        assert!((cost_for(&usage, "sonnet") - 0.03).abs() < 1e-9);
+        assert!((cost_for(&usage, "sonnet", "") - 0.03).abs() < 1e-9);
     }
 
     #[test]
@@ -276,7 +324,7 @@ mod tests {
             cache_creation_input_tokens: 0,
             server_tool_use: ServerToolUse::default(),
         };
-        assert!((cost_for(&usage, "sonnet") - 18.0).abs() < 1e-6);
+        assert!((cost_for(&usage, "sonnet", "") - 18.0).abs() < 1e-6);
         // cache_read at 0.1× input rate; cache_creation at 1.25× input rate.
         let usage2 = Usage {
             input_tokens: 0,
@@ -285,7 +333,7 @@ mod tests {
             cache_creation_input_tokens: 800_000, // 800k * $3 * 1.25 = $3
             server_tool_use: ServerToolUse::default(),
         };
-        assert!((cost_for(&usage2, "sonnet") - 6.0).abs() < 1e-6);
+        assert!((cost_for(&usage2, "sonnet", "") - 6.0).abs() < 1e-6);
     }
 
     #[test]

@@ -141,6 +141,8 @@ fn processLine(
     var role_assistant = false;
     var id_str: ?[]const u8 = null;
     var ts_value: ?f64 = null;
+    // Raw timestamp string, retained for date-aware sonnet-5 pricing.
+    var ts_date: []const u8 = "";
     var model: []const u8 = "";
     var inp: u64 = 0;
     var out_: u64 = 0;
@@ -196,7 +198,10 @@ fn processLine(
             }
         } else if (std.mem.eql(u8, key, "timestamp")) {
             const v = main.parseStringValue(&scanner, alloc) catch return;
-            if (v) |s| ts_value = main.parseTs(s) catch null;
+            if (v) |s| {
+                ts_value = main.parseTs(s) catch null;
+                ts_date = s;
+            }
         } else {
             scanner.skipValue() catch return;
         }
@@ -220,7 +225,7 @@ fn processLine(
     const ts = ts_value orelse return;
     if (ts < cutoff) return;
 
-    const usd = main.modelCost(inp, out_, cr, cw, web_searches, model);
+    const usd = main.modelCost(inp, out_, cr, cw, web_searches, model, ts_date);
 
     // model is emitted lowercased (SPEC: "Lowercased model id ...").
     const model_lower = alloc.alloc(u8, model.len) catch return;

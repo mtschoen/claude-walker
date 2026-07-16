@@ -178,7 +178,7 @@ func walkGroupEvents(paths []string, slug, sessionID string, cutoff float64) []e
 			}
 
 			model := strings.ToLower(string(msg.Model))
-			usd := costForTurn(msg.Usage, model)
+			usd := costForTurn(msg.Usage, model, string(e.Timestamp))
 
 			records = append(records, eventRecord{
 				TS:        ts,

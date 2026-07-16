@@ -25,25 +25,40 @@ PERIOD_SECONDS = 86400  # 1 day -> period_cutoff = NOW - 1 day
 WIN_START_UNIX = NOW_UNIX - 6 * 3600  # 6 hours ago
 
 # Pricing: must match SPEC.md.
-RATES = {
-    "opus": (5.0, 25.0),
-    "sonnet": (3.0, 15.0),
-    "haiku": (1.0, 5.0),
-}
-
 WEB_SEARCH_COST_USD = 0.01  # flat charge per server-side web search request
 
+# Sonnet 5 introductory pricing runs through 2026-08-31 inclusive; standard
+# pricing applies from 2026-09-01 onward. We select via a lexicographic
+# compare on the ISO-8601 date prefix (first 10 chars, "YYYY-MM-DD"), which
+# is monotonic for zero-padded dates and sidesteps timezone hair-splitting.
+SONNET5_STANDARD_FROM = "2026-09-01"
+SONNET5_INTRO_RATES = (2.0, 10.0)
+SONNET5_STANDARD_RATES = (3.0, 15.0)
 
-def rates_for(model_id: str) -> tuple[float, float]:
+
+def rates_for(model_id: str, date_prefix: str = "") -> tuple[float, float]:
     name = (model_id or "").lower()
-    for family, r in RATES.items():
-        if family in name:
-            return r
-    return RATES["sonnet"]
+    # fable/mythos first: the Fable family bills at $10/$50 and must win
+    # before any substring that could collide.
+    if "fable" in name or "mythos" in name:
+        return (10.0, 50.0)
+    if "opus" in name:
+        return (5.0, 25.0)
+    if "haiku" in name:
+        return (1.0, 5.0)
+    # sonnet-5 BEFORE the generic sonnet fallback. "sonnet-5" does NOT match
+    # "claude-sonnet-4-5" (no "sonnet-5" substring there), so 4-5 keeps the
+    # generic sonnet rates below.
+    if "sonnet-5" in name:
+        if date_prefix and date_prefix[:10] >= SONNET5_STANDARD_FROM:
+            return SONNET5_STANDARD_RATES
+        return SONNET5_INTRO_RATES
+    # sonnet — and any unknown model — falls back to sonnet rates.
+    return (3.0, 15.0)
 
 
-def cost_for(usage: dict, model_id: str) -> float:
-    inp, out = rates_for(model_id)
+def cost_for(usage: dict, model_id: str, date_prefix: str = "") -> float:
+    inp, out = rates_for(model_id, date_prefix)
 
     def as_int(value) -> int:
         # SPEC "Lenient per-field parsing": any JSON number is truncated
@@ -125,6 +140,10 @@ FRESH = NOW_UNIX - 1800       # 30 min ago: in trailing AND in window
 RECENT = NOW_UNIX - 5 * 3600  # 5h ago: in trailing AND in window
 PRE_WIN = NOW_UNIX - 12 * 3600  # 12h ago: in trailing, NOT in window
 OLD = NOW_UNIX - 2 * 86400    # 2 days ago: out of trailing AND window
+# Future anchor past the Sonnet 5 intro->standard boundary (2026-09-01). It is
+# after NOW so it lands in BOTH buckets (no upper bound on ts), letting the
+# standard-rate branch be exercised and priced.
+SONNET5_STANDARD_TS = datetime(2026, 9, 15, 12, 0, 0, tzinfo=timezone.utc).timestamp()
 
 
 def fixture_01_single_parent():
@@ -519,6 +538,76 @@ def fixture_12_wrong_typed_usage():
     return slug, {f"{sid}.jsonl": entries}
 
 
+def fixture_13_fable():
+    """Fable family (claude-fable-5) prices at $10/$50, not the $3/$15
+    unknown-family fallback. Anchored at FRESH -> both buckets."""
+    slug = "13-fable"
+    sid = "fable"
+    turns = [
+        turn("claude-fable-5", FRESH, msg_id="fa1",
+             input_tokens=1000, output_tokens=500,
+             cache_read=10000, cache_write=2000),
+    ]
+    return slug, {f"{sid}.jsonl": turns}
+
+
+def fixture_14_mythos():
+    """Mythos ids also map to the Fable family ($10/$50). Exercises the
+    second alternative of the fable/mythos matcher."""
+    slug = "14-mythos"
+    sid = "mythos"
+    turns = [
+        turn("claude-mythos-preview", FRESH, msg_id="my1",
+             input_tokens=1000, output_tokens=500,
+             cache_read=10000, cache_write=2000),
+    ]
+    return slug, {f"{sid}.jsonl": turns}
+
+
+def fixture_15_sonnet5_intro():
+    """Sonnet 5 at an intro-window timestamp (before 2026-09-01) -> $2/$10.
+    FRESH is 2026-05 so it is intro-priced and lands in both buckets."""
+    slug = "15-sonnet5-intro"
+    sid = "sonnet5intro"
+    turns = [
+        turn("claude-sonnet-5", FRESH, msg_id="s5i1",
+             input_tokens=1000, output_tokens=500,
+             cache_read=10000, cache_write=2000),
+    ]
+    return slug, {f"{sid}.jsonl": turns}
+
+
+def fixture_16_sonnet5_standard():
+    """Sonnet 5 at/after the 2026-09-01 boundary -> standard $3/$15.
+    Dated 2026-09-15 (after NOW, so still counted in both buckets)."""
+    slug = "16-sonnet5-standard"
+    sid = "sonnet5std"
+    turns = [
+        turn("claude-sonnet-5", SONNET5_STANDARD_TS, msg_id="s5s1",
+             input_tokens=1000, output_tokens=500,
+             cache_read=10000, cache_write=2000),
+    ]
+    return slug, {f"{sid}.jsonl": turns}
+
+
+def fixture_17_sonnet45_noncollision():
+    """Regression guard: claude-sonnet-4-5 must NOT match the "sonnet-5"
+    branch (no such substring) and prices at the generic sonnet $3/$15,
+    date-independent. Dated at SONNET5_STANDARD_TS to prove the date rule
+    does not touch it."""
+    slug = "17-sonnet45-noncollision"
+    sid = "sonnet45"
+    turns = [
+        turn("claude-sonnet-4-5", SONNET5_STANDARD_TS, msg_id="s45a",
+             input_tokens=1000, output_tokens=500,
+             cache_read=10000, cache_write=2000),
+        turn("claude-sonnet-4-5", FRESH, msg_id="s45b",
+             input_tokens=1000, output_tokens=500,
+             cache_read=10000, cache_write=2000),
+    ]
+    return slug, {f"{sid}.jsonl": turns}
+
+
 FIXTURES = [
     fixture_01_single_parent,
     fixture_02_parent_acompact,
@@ -532,6 +621,11 @@ FIXTURES = [
     fixture_10_iso_variants,
     fixture_11_byte_edges,
     fixture_12_wrong_typed_usage,
+    fixture_13_fable,
+    fixture_14_mythos,
+    fixture_15_sonnet5_intro,
+    fixture_16_sonnet5_standard,
+    fixture_17_sonnet45_noncollision,
 ]
 
 
@@ -583,7 +677,7 @@ def walk_group(files: dict[str, list]) -> tuple[float, float]:
             model = msg.get("model")
             if not isinstance(model, str):
                 model = ""  # wrong-typed model behaves as absent -> sonnet
-            c = cost_for(usage, model)
+            c = cost_for(usage, model, ts_str[:10])
             if ts >= period_cutoff:
                 trailing += c
             if ts >= WIN_START_UNIX:

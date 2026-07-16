@@ -557,12 +557,39 @@ fn wantsHelp(argv: [][]const u8) bool {
 /// added on top of token cost. Matches SPEC.md and the Python reference.
 pub const WEB_SEARCH_COST_USD: f64 = 0.01;
 
-pub fn modelCost(inp: u64, out_: u64, cr: u64, cw: u64, web_searches: u64, model: []const u8) f64 {
+/// Sonnet 5 intro->standard boundary. Intro pricing runs through 2026-08-31
+/// inclusive; standard applies from 2026-09-01 onward. Selection is a
+/// lexicographic compare of the turn's ISO-8601 date prefix ("YYYY-MM-DD")
+/// against this string — monotonic for zero-padded dates, no timezone math.
+pub const SONNET5_STANDARD_FROM = "2026-09-01";
+
+/// `date_prefix` is the turn's ISO-8601 timestamp (only its leading 10-char
+/// "YYYY-MM-DD" is consulted, and only for the sonnet-5 family).
+pub fn modelCost(inp: u64, out_: u64, cr: u64, cw: u64, web_searches: u64, model: []const u8, date_prefix: []const u8) f64 {
     var buf: [256]u8 = undefined;
     const n = @min(model.len, buf.len);
     const lo = std.ascii.lowerString(buf[0..n], model[0..n]);
-    const ir: f64 = if (std.mem.indexOf(u8, lo, "opus") != null) 5.0 else if (std.mem.indexOf(u8, lo, "haiku") != null) 1.0 else 3.0;
-    const or_: f64 = if (std.mem.indexOf(u8, lo, "opus") != null) 25.0 else if (std.mem.indexOf(u8, lo, "haiku") != null) 5.0 else 15.0;
+    // Ordered family match; see SPEC.md. fable/mythos first ($10/$50), then
+    // opus, haiku, then date-aware sonnet-5, then the generic sonnet default.
+    var ir: f64 = 3.0;
+    var or_: f64 = 15.0;
+    if (std.mem.indexOf(u8, lo, "fable") != null or std.mem.indexOf(u8, lo, "mythos") != null) {
+        ir = 10.0;
+        or_ = 50.0;
+    } else if (std.mem.indexOf(u8, lo, "opus") != null) {
+        ir = 5.0;
+        or_ = 25.0;
+    } else if (std.mem.indexOf(u8, lo, "haiku") != null) {
+        ir = 1.0;
+        or_ = 5.0;
+    } else if (std.mem.indexOf(u8, lo, "sonnet-5") != null) {
+        // "sonnet-5" does NOT match "claude-sonnet-4-5" (no such substring),
+        // so Sonnet 4.5 keeps the generic sonnet default below.
+        const standard = date_prefix.len >= 10 and
+            std.mem.order(u8, date_prefix[0..10], SONNET5_STANDARD_FROM) != .lt;
+        ir = if (standard) 3.0 else 2.0;
+        or_ = if (standard) 15.0 else 10.0;
+    }
     const token_cost = (@as(f64, @floatFromInt(inp)) * ir +
         @as(f64, @floatFromInt(cr)) * ir * 0.10 +
         @as(f64, @floatFromInt(cw)) * ir * 1.25 +
@@ -779,6 +806,9 @@ fn processLine(
     var role_assistant = false;
     var id_str: ?[]const u8 = null;
     var ts_value: ?f64 = null;
+    // Raw timestamp string, retained for date-aware sonnet-5 pricing. The
+    // slice points into `line` or the arena; both outlive the modelCost call.
+    var ts_date: []const u8 = "";
     var model: []const u8 = "";
     var inp: u64 = 0;
     var out_: u64 = 0;
@@ -834,7 +864,10 @@ fn processLine(
             }
         } else if (std.mem.eql(u8, key, "timestamp")) {
             const v = parseStringValue(&scanner, alloc) catch return;
-            if (v) |s| ts_value = parseTs(s) catch null;
+            if (v) |s| {
+                ts_value = parseTs(s) catch null;
+                ts_date = s;
+            }
         } else {
             scanner.skipValue() catch return;
         }
@@ -855,7 +888,7 @@ fn processLine(
     const ts = ts_value orelse return;
     if (ts < earliest) return;
 
-    const c = modelCost(inp, out_, cr, cw, web_searches, model);
+    const c = modelCost(inp, out_, cr, cw, web_searches, model, ts_date);
     if (ts >= pc) trailing.* += c;
     if (ts >= ws) window.* += c;
 }

@@ -37,10 +37,19 @@ struct Rates {
     double output;  // per MTok
 };
 
-inline Rates rates_for(std::string_view model) {
+// Sonnet 5 introductory pricing runs through 2026-08-31 inclusive; standard
+// pricing applies from 2026-09-01 onward. Selection is a lexicographic
+// compare of the ISO-8601 timestamp's 10-char date prefix ("YYYY-MM-DD")
+// against this string — monotonic for zero-padded dates, no timezone math.
+inline constexpr std::string_view SONNET5_STANDARD_FROM = "2026-09-01";
+
+// `date_prefix` is the assistant turn's ISO-8601 timestamp (the whole string
+// is fine; only its leading "YYYY-MM-DD" is consulted). Only the sonnet-5
+// family reads it; every other family ignores it.
+inline Rates rates_for(std::string_view model, std::string_view date_prefix = {}) {
     // Case-insensitive substring scan without copying or lowercasing the
     // model string — tolower-comparing only the needle bytes is fine since
-    // "opus"/"haiku" are ASCII.
+    // the family needles are ASCII.
     auto contains_ci = [&](std::string_view needle) {
         if (needle.size() > model.size()) return false;
         auto eq = [](unsigned char a, unsigned char b) {
@@ -49,8 +58,19 @@ inline Rates rates_for(std::string_view model) {
         return std::search(model.begin(), model.end(),
                            needle.begin(), needle.end(), eq) != model.end();
     };
+    // fable/mythos first: the Fable family bills at $10/$50 and must win
+    // before any substring that could collide.
+    if (contains_ci("fable") || contains_ci("mythos")) return {10.0, 50.0};
     if (contains_ci("opus"))  return {5.0, 25.0};
     if (contains_ci("haiku")) return {1.0, 5.0};
+    // sonnet-5 BEFORE the generic sonnet default. "sonnet-5" does NOT match
+    // "claude-sonnet-4-5" (no such substring), so Sonnet 4.5 keeps the
+    // generic sonnet rates below, date-independent.
+    if (contains_ci("sonnet-5")) {
+        bool standard = date_prefix.size() >= 10 &&
+                        date_prefix.substr(0, 10) >= SONNET5_STANDARD_FROM;
+        return standard ? Rates{3.0, 15.0} : Rates{2.0, 10.0};
+    }
     return {3.0, 15.0};  // sonnet or unknown -> sonnet rates
 }
 
@@ -64,9 +84,10 @@ inline double cost_for(
     uint64_t cache_read_tokens,
     uint64_t cache_write_tokens,
     uint64_t web_search_requests,
-    std::string_view model)
+    std::string_view model,
+    std::string_view date_prefix = {})
 {
-    auto [input_rate, output_rate] = rates_for(model);
+    auto [input_rate, output_rate] = rates_for(model, date_prefix);
     double token_cost = (
         static_cast<double>(input_tokens) * input_rate
         + static_cast<double>(cache_read_tokens) * input_rate * 0.10
