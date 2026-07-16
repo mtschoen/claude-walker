@@ -1,7 +1,8 @@
 # agent-walker (formerly claude-walker)
 
-Native pace-walker for Claude Code session JSONLs, implemented side-by-side
-in **Rust**, **C++**, **Zig**, and **Go** as a language comparison.
+Fast native walking for Claude Code statusline data, plus provider-neutral
+historical session search. The native walker is implemented side-by-side in
+**Rust**, **C++**, **Zig**, and **Go** as a language comparison.
 
 ## What it does
 
@@ -9,6 +10,23 @@ Walks `~/.claude/projects/**/*.jsonl` (parent transcripts + their
 `subagents/agent-*.jsonl` siblings), filters to a time range, dedupes
 assistant turns by `message.id`, and prices each turn against the canonical
 Anthropic per-MTok rate table. Emits two dollar totals on stdout.
+
+The `agent-walker` MCP server is broader: `agent_walker_search` searches Claude
+Code JSONLs and OpenCode's SQLite session store by default, labels every hit by
+provider, and merges results newest-first. This aggregation is intentionally
+limited to historical recall. OpenCode sessions do not enter Claude statusline
+costs, events, progress beacons, or active-session calculations.
+
+OpenCode discovery uses `~/.local/share/opencode/opencode.db`. Override it with
+the tool's `opencode_db` parameter or `AGENT_WALKER_OPENCODE_DB`. The provider
+opens SQLite read-only and validates the `session`, `message`, and `part`
+columns it consumes. See [`docs/provider-roadmap.md`](docs/provider-roadmap.md)
+for the Pi, Codex, Hermes, and Agy phases.
+
+OpenCode search currently supports literal substring matching. For `regex=true`,
+the generic tool still searches Claude with its native RE2 engine and reports
+OpenCode as unavailable rather than substituting Python's potentially
+backtracking regex engine.
 
 The walker reads a configurable set of project roots (default
 `~/.claude/projects` plus any extras listed in `~/.claude/walker-roots.json`),

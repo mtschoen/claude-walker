@@ -1,8 +1,20 @@
-claude-walker test report — 2026-06-10T13:32:38+00:00
-============================================================
+agent-walker test report - 2026-07-15
+=====================================
 
-Status:       PASS (100% all impls)
-Conformance:  PASS (995 checks across measured impls)
+Status:       PASS (best-effort feature mode; no native coverage regression)
+Mode:         best-effort
+Git:          46376c1 (main, working tree under test)
+MCP tests:    34 passed
+MCP coverage: OpenCode provider 214/214 statements, 68/68 branches (100%)
+              Full MCP server 377/407 statements, 92% combined branch coverage
+Lint:         ruff 0 findings
+              aislop gate PASS; 78 pre-existing repository warnings,
+              0 findings in changed Python files
+Smoke:        live OpenCode WAL search PASS; merged Claude + OpenCode PASS
+Conformance:  C++ production binary PASS (cost/events/beacons/search/CLI matrix)
+
+Native coverage baseline (last full four-implementation run: 2026-06-10)
+------------------------------------------------------------
 Cumulative:   100.00% line/statement coverage (8022/8022 pooled across 4 impls)
 Git:          5aff5a1 (remote-claude/coverage-100-2026-06-10)
 Target:       100% line/statement coverage in all four implementations

@@ -571,17 +571,30 @@ search, no mutation.
 
 ## MCP shim
 
-`mcp/server.py` is a FastMCP stdio server exposing one tool,
-`claude_walker_search`, that subprocesses `walker search ... --format jsonl`
-and reshapes the output into `{hits, summary, note}`. It exists so agents get
-auto-discovered, cross-cwd recall without constructing a CLI string — the
-cross-machine miss is exactly what an always-present tool closes.
+`mcp/server.py` is a FastMCP stdio server exposing provider-neutral historical
+recall. `agent_walker_search` searches Claude Code and OpenCode by default,
+normalizes each hit with a `provider` field, sorts the merged result
+newest-first, and returns `{hits, summary, note}`. Per-provider summaries live
+under `summary.providers`. It is the only MCP search tool; callers scope it with
+`providers` when they want one or more specific agent harnesses.
+
+This aggregation boundary is search-only. Cost, events, beacons, active-session
+tracking, and every native bare-flag invocation remain Claude-specific.
 
 - **Binary discovery** (first hit wins): `$CLAUDE_WALKER_BINARY`,
   `~/.claude/walker[.exe]`, `~/.local/bin/claude-walker[.exe]`, then `PATH`.
-- **Tool parameters** mirror the CLI flags: `pattern` (required), `regex`,
-  `case_sensitive`, `role`, `since`, `until`, `cwd_slug`, `context_turns`,
-  `limit`, `count_only`, `include_tool_blocks`.
+- **Claude provider:** subprocesses `walker search ... --format jsonl`, retaining
+  native multi-root and mounted-host behavior.
+- **OpenCode provider:** opens `~/.local/share/opencode/opencode.db` read-only,
+  validates the `session` / `message` / `part` schema, searches text parts and
+  optional tool input/output, and reads the live WAL through SQLite. Override
+  discovery with `AGENT_WALKER_OPENCODE_DB` or the `opencode_db` parameter.
+  Literal matching is supported. Regex queries report this provider unavailable
+  until a linear-time RE2-compatible matcher is available; they never fall back
+  to Python's backtracking regex engine.
+- **Generic tool parameters:** `pattern` (required), optional `providers`,
+  `regex`, `case_sensitive`, `role`, `since`, `until`, `cwd`, `context_turns`,
+  `limit`, `count_only`, `include_tool_blocks`, and `opencode_db`.
 - **Errors:** a non-zero walker exit (bad input) or a 30 s subprocess timeout
   raises an MCP tool error carrying the walker's stderr; the truncation hint
   from a successful run is passed through as `note`.
