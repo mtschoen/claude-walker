@@ -1,10 +1,8 @@
-"""MCP shim exposing claude-walker's `search` subcommand as a FastMCP tool.
+"""MCP server for provider-aware historical agent-session search.
 
-This is a thin wrapper: it discovers the installed native binary, subprocesses
-`walker search ... --format jsonl`, and reshapes the JSONL output into a
-structured `{hits, summary, note}` response. All search logic lives in the
-native impls (see SPEC.md "Subcommands"); this layer only exists so the agent
-gets auto-discovered, cross-cwd recall without having to remember a CLI.
+Claude Code search remains delegated to the native claude-walker binary.
+Provider modules handle stores with different formats, beginning with
+OpenCode's SQLite database. Cost, event, and beacon modes remain Claude-only.
 
 Launched by absolute path (`python <repo>/mcp/server.py`) rather than
 `python -m mcp` — the directory is named `mcp/` to match the spec, but `-m mcp`
@@ -35,6 +33,11 @@ if str(_SHARED_DIR) not in sys.path:
     sys.path.insert(0, str(_SHARED_DIR))
 
 from mcp.server.fastmcp import FastMCP
+from opencode_search import (
+    OpenCodeSearchError,
+    SearchOptions,
+    search as search_opencode,
+)
 from process_safe import ProcessTimeout, run_captured
 
 # Per-process request log, mirroring projdash's pattern: one JSON line per
@@ -73,7 +76,9 @@ def _truncate_argument(value: Any) -> Any:
     return text[:_ARGUMENT_REPR_LIMIT] + "...<truncated>"
 
 
-def _instrument_tool(session_id: str, function: Callable[..., Any]) -> Callable[..., Any]:
+def _instrument_tool(
+    session_id: str, function: Callable[..., Any]
+) -> Callable[..., Any]:
     """Bracket each tool call with call/return/error log entries.
 
     `functools.wraps` keeps `inspect.signature` (which FastMCP uses to derive
@@ -84,25 +89,36 @@ def _instrument_tool(session_id: str, function: Callable[..., Any]) -> Callable[
     @functools.wraps(function)
     def wrapper(**kwargs: Any) -> Any:
         start = time.monotonic()
-        _write_log(session_id, {
-            "event": "call",
-            "tool": tool_name,
-            "args": {key: _truncate_argument(value) for key, value in kwargs.items()},
-        })
+        _write_log(
+            session_id,
+            {
+                "event": "call",
+                "tool": tool_name,
+                "args": {
+                    key: _truncate_argument(value) for key, value in kwargs.items()
+                },
+            },
+        )
         try:
             result = function(**kwargs)
         except Exception as error:
             duration_ms = int((time.monotonic() - start) * 1000)
-            _write_log(session_id, {
-                "event": "error",
-                "tool": tool_name,
-                "duration_ms": duration_ms,
-                "error_type": type(error).__name__,
-                "error": str(error)[:_ERROR_MESSAGE_LIMIT],
-            })
+            _write_log(
+                session_id,
+                {
+                    "event": "error",
+                    "tool": tool_name,
+                    "duration_ms": duration_ms,
+                    "error_type": type(error).__name__,
+                    "error": str(error)[:_ERROR_MESSAGE_LIMIT],
+                },
+            )
             raise
         duration_ms = int((time.monotonic() - start) * 1000)
-        _write_log(session_id, {"event": "return", "tool": tool_name, "duration_ms": duration_ms})
+        _write_log(
+            session_id,
+            {"event": "return", "tool": tool_name, "duration_ms": duration_ms},
+        )
         return result
 
     return wrapper
@@ -123,7 +139,10 @@ def _binary_candidates() -> list[Path]:
         candidates.append(Path(override))
 
     home = Path.home()
-    for directory, stem in ((home / ".claude", "walker"), (home / ".local" / "bin", "claude-walker")):
+    for directory, stem in (
+        (home / ".claude", "walker"),
+        (home / ".local" / "bin", "claude-walker"),
+    ):
         candidates.append(directory / f"{stem}.exe")
         candidates.append(directory / stem)
 
@@ -155,7 +174,7 @@ def _run_search(arguments: list[str]) -> dict[str, Any]:
     or a subprocess timeout — FastMCP surfaces it as an MCP tool error.
 
     Shells out via process_safe.run_captured rather than bare subprocess.run:
-    this is the live MCP server behind claude_walker_search, so a wedged
+    this is the live MCP server behind agent_walker_search, so a wedged
     child (e.g. a grandchild process inheriting the stdout pipe on Windows,
     bpo-31935) would stall the whole stdio connection, not just one call.
     run_captured's abandon-reader-thread pattern guarantees the timeout below
@@ -214,14 +233,168 @@ def _run_search(arguments: list[str]) -> dict[str, Any]:
     return {"hits": hits, "summary": summary, "note": stderr or None}
 
 
+def _search_arguments(options: SearchOptions) -> list[str]:
+    arguments: list[str] = [options.pattern]
+    if options.regex:
+        arguments.append("--regex")
+    if options.case_sensitive:
+        arguments.append("--case-sensitive")
+    if options.role != "both":
+        arguments += ["--role", options.role]
+    if options.since is not None:
+        arguments += ["--since", options.since]
+    if options.until is not None:
+        arguments += ["--until", options.until]
+    if options.cwd is not None:
+        arguments += ["--cwd", options.cwd]
+    arguments += [
+        "--context",
+        str(options.context_turns),
+        "--limit",
+        str(options.limit),
+    ]
+    if options.count_only:
+        arguments.append("--count-only")
+    if options.include_tool_blocks:
+        arguments.append("--include-tool-blocks")
+    return arguments
+
+
+def _hit_sort_key(hit: dict[str, Any]) -> tuple[float, str, str, int]:
+    timestamp = str(hit.get("timestamp", ""))
+    try:
+        timestamp_value = datetime.fromisoformat(
+            timestamp.replace("Z", "+00:00")
+        ).timestamp()
+    except ValueError:
+        timestamp_value = 0.0
+    return (
+        -timestamp_value,
+        str(hit.get("provider", "")),
+        str(hit.get("session_id", "")),
+        int(hit.get("line_number", 0)),
+    )
+
+
+def _merge_provider_results(
+    results: dict[str, dict[str, Any]],
+    limit: int,
+    count_only: bool,
+    elapsed_ms: int,
+) -> dict[str, Any]:
+    hits: list[dict[str, Any]] = []
+    notes: list[str] = []
+    summaries: dict[str, dict[str, Any]] = {}
+    for provider, result in results.items():
+        summary = dict(result.get("summary") or {})
+        summary.setdefault("provider", provider)
+        summary.setdefault("available", True)
+        summaries[provider] = summary
+        for hit in result.get("hits", []):
+            normalized = dict(hit)
+            normalized.setdefault("provider", provider)
+            hits.append(normalized)
+        if result.get("note"):
+            notes.append(f"{provider}: {result['note']}")
+    hits.sort(key=_hit_sort_key)
+    provider_truncated = any(
+        summary.get("truncated", False) for summary in summaries.values()
+    )
+    globally_truncated = len(hits) > limit
+    if count_only:
+        merged_hits: list[dict[str, Any]] = []
+        hit_count = sum(int(summary.get("hits", 0)) for summary in summaries.values())
+    else:
+        merged_hits = hits[:limit]
+        hit_count = len(merged_hits)
+    summary = {
+        "type": "summary",
+        "hits": hit_count,
+        "sessions_matched": sum(
+            int(provider_summary.get("sessions_matched", 0))
+            for provider_summary in summaries.values()
+        ),
+        "roots_walked": sum(
+            int(provider_summary.get("roots_walked", 0))
+            for provider_summary in summaries.values()
+        ),
+        "files_walked": sum(
+            int(provider_summary.get("files_walked", 0))
+            for provider_summary in summaries.values()
+        ),
+        "truncated": provider_truncated or globally_truncated,
+        "elapsed_ms": elapsed_ms,
+        "providers": summaries,
+    }
+    return {"hits": merged_hits, "summary": summary, "note": "; ".join(notes) or None}
+
+
+def _run_agent_search(
+    options: SearchOptions,
+    providers: list[str] | None,
+) -> dict[str, Any]:
+    selected = ["claude", "opencode"] if providers is None else providers
+    unknown = sorted(set(selected) - {"claude", "opencode"})
+    if unknown:
+        raise ValueError(f"unknown search providers: {', '.join(unknown)}")
+    if not selected:
+        raise ValueError("providers must not be empty")
+    if options.limit < 1:
+        raise ValueError("limit must be at least 1")
+    if options.context_turns < 0:
+        raise ValueError("context_turns must not be negative")
+    started = time.monotonic()
+    results: dict[str, dict[str, Any]] = {}
+    failures: dict[str, str] = {}
+    arguments = _search_arguments(options)
+    if "claude" in selected:
+        try:
+            results["claude"] = _run_search(arguments)
+        except RuntimeError as error:
+            failures["claude"] = str(error)
+    if "opencode" in selected:
+        try:
+            results["opencode"] = search_opencode(options)
+        except OpenCodeSearchError as error:
+            failures["opencode"] = str(error)
+    if not results:
+        details = "; ".join(
+            f"{provider}: {error}" for provider, error in failures.items()
+        )
+        raise RuntimeError("all selected search providers failed: " + details)
+    for provider, error in failures.items():
+        results[provider] = {
+            "hits": [],
+            "summary": {
+                "type": "summary",
+                "provider": provider,
+                "available": False,
+                "hits": 0,
+                "sessions_matched": 0,
+                "roots_walked": 0,
+                "files_walked": 0,
+                "truncated": False,
+                "error": error,
+            },
+            "note": error,
+        }
+    merged = _merge_provider_results(
+        results,
+        options.limit,
+        options.count_only,
+        int((time.monotonic() - started) * 1000),
+    )
+    return merged
+
+
 def create_mcp_server() -> FastMCP:
     """Create and return the configured agent-walker MCP server."""
     server = FastMCP(
         "agent-walker",
         instructions=(
-            "Search past Claude Code session transcripts across all configured roots, "
-            "including cross-machine mounted roots. Use claude_walker_search when the user "
-            "refers to something said in an earlier conversation."
+            "Search past coding-agent sessions. Use agent_walker_search when the user "
+            "refers to an earlier conversation; it searches Claude Code and OpenCode by "
+            "default. Set providers to scope recall to one or more agent harnesses."
         ),
     )
 
@@ -241,61 +414,64 @@ def create_mcp_server() -> FastMCP:
     server.tool = instrumented_tool  # type: ignore[method-assign]
 
     @server.tool()
-    def claude_walker_search(
+    def agent_walker_search(
         pattern: str,
+        providers: list[Literal["claude", "opencode"]] | None = None,
         regex: bool = False,
         case_sensitive: bool = False,
         role: Literal["user", "assistant", "both"] = "both",
         since: str | None = None,
         until: str | None = None,
-        cwd_slug: str | None = None,
+        cwd: str | None = None,
         context_turns: int = 1,
         limit: int = 50,
         count_only: bool = False,
         include_tool_blocks: bool = False,
+        opencode_db: str | None = None,
     ) -> dict[str, Any]:
-        """Search past Claude Code session transcripts across all configured roots
-        (including cross-machine mounted roots) for a substring or regex pattern.
-        Returns matching messages with file paths, timestamps, and surrounding
-        context. Use this when the user says something like "you said X a few
-        sessions ago" or asks to find a past conversation — sessions on the other
-        machine are often where the agent forgets to look; each hit's `host_root`
-        tells you which machine's mount it came from.
+        """Search historical sessions across coding-agent providers.
+
+        Claude Code JSONLs and OpenCode's SQLite store are searched by default.
+        Results carry a `provider` field and retain source-specific provenance.
+        This tool is historical recall only: statusline costs, events, and progress
+        beacons remain isolated to their native agent session source.
 
         Args:
-            pattern: The substring or regex to search for. Required, non-empty.
-            regex: Treat `pattern` as an RE2 regex (no lookaround/backreferences).
-            case_sensitive: Default is case-insensitive (the usual recall case).
-            role: Restrict to "user", "assistant", or "both" message roles.
-            since: RFC3339 timestamp or relative form ("7d", "12h"). Lower bound.
-            until: Same parsing as `since`. Upper bound; defaults to now.
-            cwd_slug: Restrict to one project slug (the ~/.claude/projects/<slug> dir name).
-            context_turns: Turns of context before AND after each hit (0 = hit only).
-            limit: Cap on returned hits; the summary's `truncated` flag reports overflow.
-            count_only: Return only the summary record (no hits) — a cheap pre-flight
-                to size a query before pulling full snippets and context.
-            include_tool_blocks: Also search inside tool_use / tool_result blocks.
+            pattern: Required substring or regex.
+            providers: Providers to search; omitted means every supported provider.
+            regex: Treat pattern as an RE2 regular expression. OpenCode is
+                reported unavailable for regex queries until it has a
+                linear-time matcher; Claude search continues normally.
+            case_sensitive: Default is case-insensitive.
+            role: Restrict to user, assistant, or both.
+            since: RFC3339 timestamp or relative value such as 7d or 12h.
+            until: RFC3339 timestamp or relative upper bound.
+            cwd: Project identifier/path filter. Claude expects its project slug;
+                OpenCode matches against the stored session directory.
+            context_turns: Messages before and after each hit.
+            limit: Global cap after provider results are merged newest-first.
+            count_only: Return aggregate and per-provider counts without hits.
+            include_tool_blocks: Search tool inputs and outputs as well as prose.
+            opencode_db: Optional OpenCode database override. The environment
+                variable AGENT_WALKER_OPENCODE_DB provides a persistent override.
         """
-        arguments: list[str] = [pattern]
-        if regex:
-            arguments.append("--regex")
-        if case_sensitive:
-            arguments.append("--case-sensitive")
-        if role != "both":
-            arguments += ["--role", role]
-        if since is not None:
-            arguments += ["--since", since]
-        if until is not None:
-            arguments += ["--until", until]
-        if cwd_slug is not None:
-            arguments += ["--cwd", cwd_slug]
-        arguments += ["--context", str(context_turns)]
-        arguments += ["--limit", str(limit)]
-        if count_only:
-            arguments.append("--count-only")
-        if include_tool_blocks:
-            arguments.append("--include-tool-blocks")
-        return _run_search(arguments)
+        return _run_agent_search(
+            SearchOptions(
+                pattern=pattern,
+                regex=regex,
+                case_sensitive=case_sensitive,
+                role=role,
+                since=since,
+                until=until,
+                cwd=cwd,
+                context_turns=context_turns,
+                limit=limit,
+                count_only=count_only,
+                include_tool_blocks=include_tool_blocks,
+                db_path=opencode_db,
+            ),
+            providers,
+        )
 
     return server
 

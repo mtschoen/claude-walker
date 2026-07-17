@@ -1,17 +1,17 @@
-claude-walker test report — 2026-06-10T13:32:38+00:00
+claude-walker test report — 2026-07-16T18:44:30+00:00
 ============================================================
 
 Status:       PASS (100% all impls)
 Conformance:  PASS (995 checks across measured impls)
-Cumulative:   100.00% line/statement coverage (8022/8022 pooled across 4 impls)
-Git:          5aff5a1 (remote-claude/coverage-100-2026-06-10)
+Cumulative:   100.00% line/statement coverage (8039/8039 pooled across 4 impls)
+Git:          61e4d1d (feat/cross-agent-session-search)
 Target:       100% line/statement coverage in all four implementations
 
 Per-implementation coverage
 ------------------------------------------------------------
 impl   metric         covered/total    cover   conformance
 rust   lines              1660/1660  100.00%   PASS (249 ok)
-cpp    lines              2852/2852  100.00%   PASS (249 ok)
+cpp    lines              2869/2869  100.00%   PASS (249 ok)
 go     statements         1330/1330  100.00%   PASS (249 ok)
 zig    lines              2180/2180  100.00%   PASS (248 ok)
 
@@ -34,7 +34,7 @@ zig    lines              2180/2180  100.00%   PASS (248 ok)
     main.cpp                 197/197   100.00%
     pricing.hpp               36/36    100.00%
     search.cpp               874/874   100.00%
-    walker_roots.hpp          77/77    100.00%
+    walker_roots.hpp          94/94    100.00%
 
 ### go — 100.00% (0 statements uncovered)
     beacons.go               380/380   100.00%

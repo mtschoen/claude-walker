@@ -15,10 +15,12 @@ agent-statusline status line to answer two questions fast:
    progress beacons (`<progress-beacon>{...}</progress-beacon>` blocks
    in assistant message text) and compute calibration `bias_factor`.
 
-Two auxiliary subcommands round out the tool (not used by the status
+Two auxiliary subcommands round out the native tool (not used by the status
 line): `events` (one NDJSON line per assistant turn, feeds the `/spend`
-dashboard) and `search` (full-text transcript search, backs the
-`agent-walker` MCP server).
+dashboard) and `search` (Claude full-text transcript search). The
+`agent-walker` MCP server aggregates that native search with provider modules
+such as OpenCode SQLite. Provider aggregation is historical-search-only; it
+must not enter cost, event, beacon, or active-session calculations.
 
 Authoritative contract: `SPEC.md`. Every implementation must match.
 

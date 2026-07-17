@@ -214,8 +214,8 @@ bash install.sh        # or install.bat — rebuilds cpp + copies to ~/.local/bi
 ```
 
 Then in `mcp/server.py`: add `include_queue_ops: bool = False` to the
-`claude_walker_search` tool signature + docstring, and map it to
-`--include-queue-ops` in the arg builder (mirror `include_tool_blocks`).
+`agent_walker_search` tool signature + docstring, and map it to the Claude
+provider's `--include-queue-ops` argument (mirror `include_tool_blocks`).
 Update the `## MCP shim` section's parameter list in `SPEC.md`. Smoke-test
 the shim (the previous session's pattern: instantiate `create_mcp_server`,
 `list_tools`, call with `include_queue_ops=True` against a known queued
