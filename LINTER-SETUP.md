@@ -18,7 +18,7 @@ Recommended linting setup for claude-walker — fleet survey 2026-05-29.
 
 **Existing linter/formatter config:** none found — no `.golangci.yml`, no `.clang-format`, no `.clang-tidy`, no `Cargo.toml [lints]`, no `pyproject.toml`, no `.pre-commit-config.yaml`.
 
-**Existing CI** (`.gitea/workflows/ci.yml`): builds all four native impls on Linux + Windows, runs conformance and coverage gates. **No lint steps.**
+**Existing CI** (`.gitea/workflows/ci.yml`): builds changed native impls on Linux + Windows, with shared, CI, and unrecognized paths selecting all four, then runs matching conformance and coverage gates. **No lint steps.**
 
 **Existing Claude Code on-save hook** (`.claude/settings.local.json`): no `PostToolUse` hook present.
 

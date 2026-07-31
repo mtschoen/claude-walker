@@ -184,13 +184,16 @@ Current numbers, methodology, and optimization notes live in `PERF-RESULTS.md`.
 
 ## CI
 
-`.gitea/workflows/ci.yml` builds all four impls on `ubuntu-latest` +
-`windows-latest` (the llamabox Gitea Actions runners) and runs
-`python shared/conformance.py rust cpp go zig` on each. A third
-`coverage-linux` job builds kcov-master and runs
-`python shared/coverage.py --baseline …` to gate per-impl regression
-against the documented baseline. Triggers on push to `main`,
-pull_request to `main`, and `workflow_dispatch`.
+`.gitea/workflows/ci.yml` detects changed implementation directories and
+builds only those impls on `ubuntu-latest` + `windows-latest` (the llamabox
+Gitea Actions runners). Changes under `shared/`, `.gitea/`, or `ci/`, plus
+`SPEC.md`, select all four implementations. Unrecognized paths also select
+all four so only changes confined to known implementation directories narrow
+the existing checks. A third `coverage-linux` job runs
+`python shared/coverage.py` for the same selection to gate per-impl regression
+against the documented baseline. Triggers on push to `main`, pull_request to
+`main`, and `workflow_dispatch`; manual dispatch selects all four
+implementations.
 
 **Footgun:** `conformance.py` silently prints SKIP and exits 0 when
 a binary is missing — a misnamed output path would masquerade as a

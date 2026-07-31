@@ -1,9 +1,9 @@
 name: CI
 
-# Build all four impls (Rust, C++, Go, Zig) on Linux + Windows and run
-# `python shared/conformance.py` against the corpus. Triggers on push to
-# main, pull_request to main, and workflow_dispatch (for iteration on a
-# feature branch without opening a PR).
+# Build changed implementations on Linux + Windows and run conformance
+# against the corpus. Shared, CI, or unrecognized paths select all four
+# so only implementation-directory changes narrow the existing checks.
+# workflow_dispatch also selects all four implementations.
 
 on:
   push:
@@ -21,10 +21,68 @@ env:
   FORCE_COLOR: '0'
 
 jobs:
+  detect-changes:
+    name: Select implementations
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.selection.outputs.rust }}
+      cpp: ${{ steps.selection.outputs.cpp }}
+      go: ${{ steps.selection.outputs.go }}
+      zig: ${{ steps.selection.outputs.zig }}
+      any: ${{ steps.selection.outputs.any }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Select changed implementations
+        id: selection
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PULL_REQUEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PULL_REQUEST_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BASE_SHA: ${{ github.event.before }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          python -m unittest ci.test_select_languages
+          selection_file="$(mktemp)"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            python ci/select_languages.py --all < /dev/null > "$selection_file"
+          else
+            if [ "$EVENT_NAME" = "pull_request" ]; then
+              BASE_SHA="$PULL_REQUEST_BASE_SHA"
+              HEAD_SHA="$PULL_REQUEST_HEAD_SHA"
+            else
+              BASE_SHA="$PUSH_BASE_SHA"
+              HEAD_SHA="$CURRENT_SHA"
+            fi
+          fi
+          if [ "$EVENT_NAME" != "workflow_dispatch" ] &&
+             { [ -z "$BASE_SHA" ] ||
+               [[ "$BASE_SHA" =~ ^0+$ ]] ||
+               ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null ||
+               ! git cat-file -e "${HEAD_SHA}^{commit}" 2>/dev/null; }; then
+            echo "::warning::change range unavailable; selecting all implementations"
+            python ci/select_languages.py --all < /dev/null > "$selection_file"
+          elif [ "$EVENT_NAME" != "workflow_dispatch" ]; then
+            git diff --name-only "$BASE_SHA" "$HEAD_SHA" |
+              python ci/select_languages.py > "$selection_file"
+          fi
+          cat "$selection_file"
+          cat "$selection_file" >> "$GITHUB_OUTPUT"
+
   test-linux:
     name: Build + Conformance (Linux)
+    needs: detect-changes
+    if: needs.detect-changes.outputs.any == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      RUN_RUST: ${{ needs.detect-changes.outputs.rust }}
+      RUN_CPP: ${{ needs.detect-changes.outputs.cpp }}
+      RUN_GO: ${{ needs.detect-changes.outputs.go }}
+      RUN_ZIG: ${{ needs.detect-changes.outputs.zig }}
     steps:
       - uses: actions/checkout@v4
 
@@ -38,6 +96,7 @@ jobs:
           done
 
       - name: Install cmake
+        if: needs.detect-changes.outputs.cpp == 'true'
         # The gitea/runner-images:ubuntu-latest container ships g++/make
         # but not cmake.
         run: |
@@ -52,12 +111,15 @@ jobs:
           python-version: '3.11'
 
       - uses: actions/setup-go@v5
+        if: needs.detect-changes.outputs.go == 'true'
         with:
           go-version-file: go/go.mod
 
       - uses: dtolnay/rust-toolchain@stable
+        if: needs.detect-changes.outputs.rust == 'true'
 
       - name: Install Zig 0.16.0
+        if: needs.detect-changes.outputs.zig == 'true'
         # Asset name changed in 0.16.0 from `zig-{os}-{arch}-{ver}` to
         # `zig-{arch}-{os}-{ver}`.
         run: |
@@ -70,30 +132,39 @@ jobs:
           "$HOME/.local/zig/zig" version
 
       - name: Build Rust
+        if: needs.detect-changes.outputs.rust == 'true'
         working-directory: rust
         run: cargo build --release
 
       - name: Build C++
+        if: needs.detect-changes.outputs.cpp == 'true'
         run: |
           cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release
           cmake --build cpp/build --config Release -j
 
       - name: Build Go
+        if: needs.detect-changes.outputs.go == 'true'
         working-directory: go
         run: go build -o walker .
 
       - name: Build Zig
+        if: needs.detect-changes.outputs.zig == 'true'
         working-directory: zig
         run: zig build
 
-      - name: Verify all binaries built
+      - name: Verify selected binaries built
         # conformance.py silently SKIPs (and exits 0) when a binary
         # is missing — gate explicitly so a misnamed output path
         # doesn't masquerade as a green run.
         run: |
           set -e
           missing=0
-          for bin in rust/target/release/walker cpp/build/walker go/walker zig/zig-out/bin/walker; do
+          bins=()
+          [ "$RUN_RUST" = "true" ] && bins+=(rust/target/release/walker)
+          [ "$RUN_CPP" = "true" ] && bins+=(cpp/build/walker)
+          [ "$RUN_GO" = "true" ] && bins+=(go/walker)
+          [ "$RUN_ZIG" = "true" ] && bins+=(zig/zig-out/bin/walker)
+          for bin in "${bins[@]}"; do
             if [ -x "$bin" ]; then
               echo "  ok: $bin"
             else
@@ -104,12 +175,25 @@ jobs:
           [ "$missing" -eq 0 ]
 
       - name: Run conformance
-        run: python shared/conformance.py rust cpp go zig
+        run: |
+          languages=()
+          [ "$RUN_RUST" = "true" ] && languages+=(rust)
+          [ "$RUN_CPP" = "true" ] && languages+=(cpp)
+          [ "$RUN_GO" = "true" ] && languages+=(go)
+          [ "$RUN_ZIG" = "true" ] && languages+=(zig)
+          python shared/conformance.py "${languages[@]}"
 
   test-windows:
     name: Build + Conformance (Windows)
+    needs: detect-changes
+    if: needs.detect-changes.outputs.any == 'true'
     runs-on: windows-latest
     timeout-minutes: 45
+    env:
+      RUN_RUST: ${{ needs.detect-changes.outputs.rust }}
+      RUN_CPP: ${{ needs.detect-changes.outputs.cpp }}
+      RUN_GO: ${{ needs.detect-changes.outputs.go }}
+      RUN_ZIG: ${{ needs.detect-changes.outputs.zig }}
     steps:
       - uses: actions/checkout@v4
 
@@ -130,39 +214,43 @@ jobs:
           }
 
       - uses: actions/setup-go@v5
+        if: needs.detect-changes.outputs.go == 'true'
         with:
           go-version-file: go/go.mod
 
       - name: Build Rust
+        if: needs.detect-changes.outputs.rust == 'true'
         shell: pwsh
         working-directory: rust
         run: cargo build --release
 
       - name: Build C++
+        if: needs.detect-changes.outputs.cpp == 'true'
         shell: pwsh
         run: |
           cmake -S cpp -B cpp\build -DCMAKE_BUILD_TYPE=Release
           cmake --build cpp\build --config Release -j
 
       - name: Build Go
+        if: needs.detect-changes.outputs.go == 'true'
         shell: pwsh
         working-directory: go
         run: go build -o walker.exe .
 
       - name: Build Zig
+        if: needs.detect-changes.outputs.zig == 'true'
         shell: pwsh
         working-directory: zig
         run: zig build
 
-      - name: Verify all binaries built
+      - name: Verify selected binaries built
         shell: pwsh
         run: |
-          $bins = @(
-            "rust\target\release\walker.exe",
-            "cpp\build\Release\walker.exe",
-            "go\walker.exe",
-            "zig\zig-out\bin\walker.exe"
-          )
+          $bins = @()
+          if ($env:RUN_RUST -eq "true") { $bins += "rust\target\release\walker.exe" }
+          if ($env:RUN_CPP -eq "true") { $bins += "cpp\build\Release\walker.exe" }
+          if ($env:RUN_GO -eq "true") { $bins += "go\walker.exe" }
+          if ($env:RUN_ZIG -eq "true") { $bins += "zig\zig-out\bin\walker.exe" }
           $missing = $false
           foreach ($b in $bins) {
             if (Test-Path $b) {
@@ -176,16 +264,30 @@ jobs:
 
       - name: Run conformance
         shell: pwsh
-        run: python shared/conformance.py rust cpp go zig
+        run: |
+          $languages = @()
+          if ($env:RUN_RUST -eq "true") { $languages += "rust" }
+          if ($env:RUN_CPP -eq "true") { $languages += "cpp" }
+          if ($env:RUN_GO -eq "true") { $languages += "go" }
+          if ($env:RUN_ZIG -eq "true") { $languages += "zig" }
+          python shared/conformance.py @languages
 
   coverage-linux:
     name: Coverage Gate (Linux)
+    needs: detect-changes
+    if: needs.detect-changes.outputs.any == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      RUN_RUST: ${{ needs.detect-changes.outputs.rust }}
+      RUN_CPP: ${{ needs.detect-changes.outputs.cpp }}
+      RUN_GO: ${{ needs.detect-changes.outputs.go }}
+      RUN_ZIG: ${{ needs.detect-changes.outputs.zig }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install build + coverage + kcov runtime deps
+        if: needs.detect-changes.outputs.cpp == 'true' || needs.detect-changes.outputs.zig == 'true'
         # clang + llvm: required for the C++ source-based coverage path
         #   (clang++ produces .profraw via -fprofile-instr-generate, then
         #   llvm-profdata/llvm-cov merge + report).
@@ -200,43 +302,52 @@ jobs:
           set -e
           if command -v sudo >/dev/null 2>&1; then SUDO=sudo; else SUDO=; fi
           $SUDO apt-get update
-          $SUDO apt-get install -y --no-install-recommends \
-            cmake build-essential pkg-config git curl tar xz-utils \
-            clang llvm \
-            libdw-dev libcurl4-openssl-dev libelf-dev libiberty-dev \
-            binutils-dev zlib1g-dev
-          CLANG_VERSION=$(clang --version | grep -oP 'clang version \K\d+' | head -1)
-          if [ -z "$CLANG_VERSION" ]; then
-            echo "::error::could not detect installed clang major version"
-            exit 1
+          packages=(cmake build-essential pkg-config)
+          if [ "$RUN_CPP" = "true" ]; then
+            packages+=(clang llvm)
           fi
-          echo "installed clang major version: $CLANG_VERSION"
-          $SUDO apt-get install -y --no-install-recommends \
-            "libclang-rt-${CLANG_VERSION}-dev"
-          # Confirm the profile runtime is actually present before
-          # proceeding — otherwise the cmake build will fail late with a
-          # missing libclang_rt.profile-x86_64.a linker error.
-          test -f "/usr/lib/llvm-${CLANG_VERSION}/lib/clang/${CLANG_VERSION}/lib/linux/libclang_rt.profile-x86_64.a" \
-            || { echo "::error::libclang_rt.profile-x86_64.a missing after install"; exit 1; }
+          if [ "$RUN_ZIG" = "true" ]; then
+            packages+=(
+              git curl tar xz-utils libdw-dev libcurl4-openssl-dev
+              libelf-dev libiberty-dev binutils-dev zlib1g-dev
+            )
+          fi
+          $SUDO apt-get install -y --no-install-recommends "${packages[@]}"
+          if [ "$RUN_CPP" = "true" ]; then
+            CLANG_VERSION=$(clang --version | grep -oP 'clang version \K\d+' | head -1)
+            if [ -z "$CLANG_VERSION" ]; then
+              echo "::error::could not detect installed clang major version"
+              exit 1
+            fi
+            echo "installed clang major version: $CLANG_VERSION"
+            $SUDO apt-get install -y --no-install-recommends \
+              "libclang-rt-${CLANG_VERSION}-dev"
+            test -f "/usr/lib/llvm-${CLANG_VERSION}/lib/clang/${CLANG_VERSION}/lib/linux/libclang_rt.profile-x86_64.a" ||
+              { echo "::error::libclang_rt.profile-x86_64.a missing after install"; exit 1; }
+          fi
 
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - uses: actions/setup-go@v5
+        if: needs.detect-changes.outputs.go == 'true'
         with:
           go-version-file: go/go.mod
 
       - uses: dtolnay/rust-toolchain@stable
+        if: needs.detect-changes.outputs.rust == 'true'
         with:
           components: llvm-tools-preview
 
       - name: Install cargo-llvm-cov
+        if: needs.detect-changes.outputs.rust == 'true'
         # External-test workflow for collecting Rust coverage off the
         # conformance harness (see shared/coverage.py::cov_rust).
         run: cargo install cargo-llvm-cov --locked
 
       - name: Install Zig 0.16.0
+        if: needs.detect-changes.outputs.zig == 'true'
         run: |
           set -e
           ZIG_VERSION=0.16.0
@@ -247,6 +358,7 @@ jobs:
           "$HOME/.local/zig/zig" version
 
       - name: Build kcov-master (DWARF5-capable)
+        if: needs.detect-changes.outputs.zig == 'true'
         # Stock kcov 43 and liyu1981/zig-kcov both fail on Zig 0.16's
         # LLVM-backend DWARF5 output (see CLAUDE.md / COVERAGE-PLAN.md).
         # SimonKagstrom/kcov master is the only one that parses it.
@@ -271,7 +383,26 @@ jobs:
         # restore the bare invocation once those tests pin HOME/USERPROFILE
         # to fixture dirs (see next-session-handoff memory note).
         run: |
-          python shared/coverage.py --baseline rust=99.64,cpp=100.00,go=99.62,zig=100.00
+          languages=()
+          baselines=()
+          if [ "$RUN_RUST" = "true" ]; then
+            languages+=(rust)
+            baselines+=(rust=99.64)
+          fi
+          if [ "$RUN_CPP" = "true" ]; then
+            languages+=(cpp)
+            baselines+=(cpp=100.00)
+          fi
+          if [ "$RUN_GO" = "true" ]; then
+            languages+=(go)
+            baselines+=(go=99.62)
+          fi
+          if [ "$RUN_ZIG" = "true" ]; then
+            languages+=(zig)
+            baselines+=(zig=100.00)
+          fi
+          baseline_csv=$(IFS=,; echo "${baselines[*]}")
+          python shared/coverage.py "${languages[@]}" --baseline "$baseline_csv"
 
       - name: Post coverage status
         # Posts a Gitea commit status (context=pr-crew/coverage) with
