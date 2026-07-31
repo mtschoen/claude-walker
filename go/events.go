@@ -223,16 +223,7 @@ func runEvents(rawArgs []string) {
 	}
 	work := make(chan groupWork, len(groups))
 
-	// runtime.NumCPU is documented to return a value >= 1, so no lower
-	// clamp is needed; cap at 8 to avoid runaway parallelism on big hosts.
-	// Also shrink to group count when smaller so we don't spawn idle workers.
-	numWorkers := runtime.NumCPU()
-	if numWorkers > 8 {
-		numWorkers = 8
-	}
-	if numWorkers > len(groups) && len(groups) > 0 {
-		numWorkers = len(groups)
-	}
+	numWorkers := effectiveEventWorkerCount(runtime.NumCPU(), len(groups))
 
 	perWorker := make([][]eventRecord, numWorkers)
 	var wg sync.WaitGroup

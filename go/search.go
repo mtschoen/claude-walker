@@ -955,12 +955,7 @@ func runSearch(argv []string) {
 	// docs ("safe for concurrent use by multiple goroutines"). sonic's
 	// Unmarshal is documented thread-safe. Mirrors the cost-mode pattern
 	// in main.go's runCost (channel + sync.WaitGroup + per-worker accumulator).
-	// runtime.NumCPU is documented to return a value >= 1, so no lower
-	// clamp is needed; cap at 8 to avoid runaway parallelism on big hosts.
-	numWorkers := runtime.NumCPU()
-	if numWorkers > 8 {
-		numWorkers = 8
-	}
+	numWorkers := effectiveWorkerCount(runtime.NumCPU())
 
 	work := make(chan searchFileInfo, len(files))
 	perWorkerHits := make([][]searchHit, numWorkers)

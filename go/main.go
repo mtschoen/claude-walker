@@ -602,11 +602,7 @@ func runCost(rawArgs []string) {
 		groupSlices = append(groupSlices, paths)
 	}
 
-	// Use min(8, numCPU) workers.
-	numWorkers := runtime.NumCPU()
-	if numWorkers > 8 {
-		numWorkers = 8
-	}
+	numWorkers := effectiveWorkerCount(runtime.NumCPU())
 
 	type result struct {
 		trailing float64
