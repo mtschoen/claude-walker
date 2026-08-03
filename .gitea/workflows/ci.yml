@@ -21,6 +21,39 @@ env:
   FORCE_COLOR: '0'
 
 jobs:
+  quality:
+    name: aislop Quality Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # github.com/mtschoen/aislop @ schoen/main 2026-08-02, same pin as
+      # schoen-lab's aislop.yml. The C# engine lives only in the fork; the
+      # npm registry publish route is retired. Bump deliberately; do not
+      # track the moving branch.
+      AISLOP_FORK_COMMIT: ce200f2f884facc90ccae4f66a2693fdd78f0084
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build aislop (pinned fork commit)
+        # Cloned outside the workspace so aislop does not scan the fork's own
+        # source. npm install runs the fork's prepare step, which builds
+        # dist/. Installing the fork as a pnpm/npm git dependency does not
+        # work on this fleet (pnpm dies in the package's prepare step with
+        # ERR_PNPM_PREPARE_PACKAGE; npm on the runners blocks git deps); the
+        # clone+npm pattern below is the fleet-standard install, matching
+        # schoen-lab's .gitea/workflows/aislop.yml.
+        run: |
+          git clone https://github.com/mtschoen/aislop.git "$RUNNER_TEMP/aislop"
+          git -C "$RUNNER_TEMP/aislop" checkout "$AISLOP_FORK_COMMIT"
+          (cd "$RUNNER_TEMP/aislop" && npm install --no-audit --no-fund)
+
+      - name: Run aislop quality gate
+        run: node "$RUNNER_TEMP/aislop/dist/cli.js" ci .
+
   detect-changes:
     name: Select implementations
     runs-on: ubuntu-latest
@@ -74,7 +107,7 @@ jobs:
 
   test-linux:
     name: Build + Conformance (Linux)
-    needs: detect-changes
+    needs: [quality, detect-changes]
     if: needs.detect-changes.outputs.any == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -185,7 +218,7 @@ jobs:
 
   test-windows:
     name: Build + Conformance (Windows)
-    needs: detect-changes
+    needs: [quality, detect-changes]
     if: needs.detect-changes.outputs.any == 'true'
     runs-on: windows-latest
     timeout-minutes: 45
@@ -274,7 +307,7 @@ jobs:
 
   coverage-linux:
     name: Coverage Gate (Linux)
-    needs: detect-changes
+    needs: [quality, detect-changes]
     if: needs.detect-changes.outputs.any == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45

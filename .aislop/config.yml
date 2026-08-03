@@ -1,0 +1,21 @@
+ci:
+  # Ratchet the warning-heavy legacy baseline while every error remains fatal.
+  failBelow: 20
+
+exclude:
+  # Generated fixtures and local performance corpora are not maintained source.
+  - shared/corpus/**
+  - shared/corpus-perf/**
+  - shared/corpus-perf-beacons/**
+
+  # Build, coverage, cache, and local environment outputs.
+  - coverage/**
+  - cpp/build/**
+  - cpp/build-cov/**
+  - go/covdata/**
+  - go/covdata-unit/**
+  - mcp/.venv/**
+  - rust/target/**
+  - zig/.zig-cache/**
+  - zig/zig-cache/**
+  - zig/zig-out/**

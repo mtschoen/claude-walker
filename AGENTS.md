@@ -76,9 +76,8 @@ If you change a fixture, regenerate the expected files via the matching
 
 ## Linting / static analysis
 
-No lint gate in CI yet (planned testing/coverage work is in
-`COVERAGE-PLAN.md`). The per-impl commands that keep the tree
-warning-clean:
+CI runs `aislop ci .` before build, conformance, and coverage jobs. The
+per-implementation commands below remain the deeper language-specific checks:
 
 - **C++** — `clang-tidy` against the compile DB, scoped to our TUs with
   simdjson headers filtered out. **Windows caveat:** the Visual Studio CMake

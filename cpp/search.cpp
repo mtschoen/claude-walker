@@ -234,8 +234,8 @@ struct LiteralPrefilter {
       return hay.find(original) != std::string_view::npos;
     if (containsAsciiCI(hay, lower))
       return true;
-    return fold_hazard && (memchr(hay.data(), '\xE2', hay.size()) != nullptr ||
-                           memchr(hay.data(), '\xC5', hay.size()) != nullptr);
+    return fold_hazard && (memchr(hay.data(), 0xE2, hay.size()) != nullptr ||
+                           memchr(hay.data(), 0xC5, hay.size()) != nullptr);
   }
 };
 

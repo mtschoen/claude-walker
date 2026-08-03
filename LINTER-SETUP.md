@@ -16,9 +16,14 @@ Recommended linting setup for claude-walker — fleet survey 2026-05-29.
 | `zig/src/` | Zig | `*.zig` (main, beacons, events, search, walker_roots) |
 | `shared/`, `mcp/`, `ci/` | Python | conformance, coverage, bench, corpus generators, MCP server, CI post-status |
 
-**Existing linter/formatter config:** none found — no `.golangci.yml`, no `.clang-format`, no `.clang-tidy`, no `Cargo.toml [lints]`, no `pyproject.toml`, no `.pre-commit-config.yaml`.
+**Existing linter/formatter config:** `ruff.toml` and `.aislop/config.yml`.
+There is no `.golangci.yml`, `.clang-format`, `.clang-tidy`, `Cargo.toml
+[lints]`, `pyproject.toml`, or `.pre-commit-config.yaml`.
 
-**Existing CI** (`.gitea/workflows/ci.yml`): builds changed native impls on Linux + Windows, with shared, CI, and unrecognized paths selecting all four, then runs matching conformance and coverage gates. **No lint steps.**
+**Existing CI** (`.gitea/workflows/ci.yml`): runs the aislop quality gate,
+then builds changed native implementations on Linux + Windows and runs matching
+conformance and coverage gates. Language-specific lint commands remain local
+checks.
 
 **Existing Claude Code on-save hook** (`.claude/settings.local.json`): no `PostToolUse` hook present.
 
@@ -246,19 +251,15 @@ Add a `lint` job to `.gitea/workflows/ci.yml`. It can run in parallel with the e
 
 ## AI-slop gate (aislop)
 
-**aislop** (https://github.com/scanaislop/aislop · MIT · Node >= 20) is a
-language-agnostic, deterministic AI-slop quality gate — no LLM, 40+ rules,
+**aislop** (https://github.com/scanaislop/aislop, MIT, Node >= 20) is a
+language-agnostic, deterministic AI-slop quality gate with no LLM and 40+ rules,
 scored 0–100. It flags agent slop: narrative/trivial comments, swallowed/broad
 exceptions, `as any`, dead code, unused/hallucinated imports, innerHTML/XSS
 sinks, and similar patterns.
 
-**Applicability for this repo — PARTIAL.** aislop supports TS/JS, Python, Go,
-Rust, Ruby, PHP, and Java. It does **not** support C++ or Zig. In this repo,
-aislop covers the **Go, Rust, and Python** surface (`go/`, `rust/`, `shared/`,
-`mcp/`, `ci/`). The **C++ (`cpp/`) and Zig (`zig/`) implementations are out of
-aislop's scope** — those rely entirely on their per-language linters
-(`clang-format` / `clang-tidy` / `cppcheck` for C++; `zig fmt` / `zig build`
-for Zig) as the real quality gate.
+The project uses the `mtschoen/aislop` fork so the scan also runs cppcheck over
+the C++ surface. Zig still relies on `zig fmt` and `zig build` for its
+language-specific checks.
 
 ### Per-edit (① on-save)
 
@@ -273,53 +274,33 @@ both slow and non-deterministic.
 ### PR / CI gate (③)
 
 ```bash
-npx --yes aislop@0.9.4 ci .
+aislop ci .
 ```
 
-Add this as a step in the `lint` job in `.gitea/workflows/ci.yml`. aislop has
-**no diff/changed-files mode** — it scores the entire repo. The PR gate is
-"don't regress the whole-repo score", not a per-diff check.
-
-On Gitea Actions, use the CLI form above — **not** the GitHub composite action
-`scanaislop/aislop@vX`, which is GitHub-only. Always pin the version (e.g.
-`0.9.4`), not `@latest`.
+The `quality` job in `.gitea/workflows/ci.yml` installs the project-standard
+`mtschoen/aislop#schoen/main` fork and runs this command before builds and
+tests. The gate scans the entire repository so changes cannot hide behind
+language selection.
 
 ### Config (`.aislop/config.yml`)
 
 ```yaml
 ci:
-  failBelow: 80   # reference: git-wizard's gate is 80
+  # Ratchet the warning-heavy legacy baseline while every error remains fatal.
+  failBelow: 20
 exclude:
-  - cpp/**        # out of scope — clang-tidy/cppcheck handle this
-  - zig/**        # out of scope — zig fmt/build handles this
+  - shared/corpus/**
+  - shared/corpus-perf/**
+  - shared/corpus-perf-beacons/**
+  # Build, coverage, cache, and local environment outputs are also excluded.
 ```
 
-Further tunables: `extends`, and whole-engine on/off (`format` / `lint` /
-`code-quality` / `ai-slop` / `security` / `architecture`). Note: **no
-per-rule config exists in aislop 0.9.4** — you can toggle whole engines but
-cannot silence individual rules.
+The initial scan scores 20/100 with 164 warning-severity style and complexity
+findings. Those are retained so the score can ratchet upward. Error-severity
+findings are always fatal, independent of the score threshold.
 
-### Expected false positives for this repo's languages
-
-- **Python — `ai-slop/unused-import` on `from __future__ import annotations`:**
-  aislop 0.9.4 flags this as an unused import. Ruff/Pyflakes specifically
-  exempt `__future__` imports; aislop doesn't. Do **not** remove this line —
-  it changes annotation-evaluation semantics (PEP 563). Exclude the affected
-  files or disable the `ai-slop` engine if this dominates the score.
-- **Python — `python-mutable-default`:** fires on FastAPI/Typer
-  `Body(default={})` — not slop in that context.
-- **Go / Rust:** hallucinated-import rule can flag first-party local modules.
-- **Any JS if added:** innerHTML rule fires on static strings (defense-in-depth
-  by design — not exploitable, but aislop treats it as a smell).
-
-### Rollout
-
-Clean up first, then gate — don't ratchet from a noisy baseline. Run
-`npx aislop@0.9.4 scan .` to see the current score and findings, fix real
-slop (concentrate on the Go/Rust/Python surface), then set `ci.failBelow` to
-a value at or just below the clean-baseline score.
-
-Full detail: `C:\Users\mtsch\.claude\notes\idioms_linters.md` (AI-slop gate section).
+Run `aislop scan .` locally to inspect findings. Before committing, use
+`aislop scan --staged` to check only the proposed change.
 
 ---
 
