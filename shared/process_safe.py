@@ -30,9 +30,30 @@ New code in this repo that needs to shell out must call ``run_captured`` /
 
 from __future__ import annotations
 
+import os
 import subprocess
 import threading
 from dataclasses import dataclass
+
+
+def _windows_hidden_kwargs() -> dict[str, object]:
+    """creationflags + startupinfo that keep a child's console window hidden.
+
+    ``CREATE_NO_WINDOW`` alone is not enough on Windows 11 / Windows Terminal,
+    which frequently ignore it and still flash a console for ``python.exe`` /
+    ``git.exe`` children; a ``STARTUPINFO`` carrying ``SW_HIDE`` is layered on
+    top. ``getattr`` guards keep the ``nt`` arm exercisable on any host.
+    """
+    kwargs: dict[str, object] = {
+        "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    }
+    startupinfo_type = getattr(subprocess, "STARTUPINFO", None)
+    if startupinfo_type is not None:
+        startupinfo = startupinfo_type()
+        startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 1)
+        startupinfo.wShowWindow = 0  # SW_HIDE
+        kwargs["startupinfo"] = startupinfo
+    return kwargs
 
 
 @dataclass(frozen=True)
@@ -82,6 +103,9 @@ def run_captured(
     stderr attached) so callers that relied on ``subprocess.run(check=True)``
     can keep their existing ``except CalledProcessError`` handling.
     """
+    hide_kwargs: dict[str, object] = {}
+    if os.name == "nt":
+        hide_kwargs = _windows_hidden_kwargs()
     process = subprocess.Popen(
         command,
         cwd=cwd,
@@ -93,6 +117,7 @@ def run_captured(
         errors=errors,
         env=env,
         close_fds=True,
+        **hide_kwargs,
     )
 
     captured: dict[str, str] = {}
