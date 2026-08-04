@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <unordered_set>
@@ -27,6 +28,13 @@ namespace walker {
 
 namespace sj = simdjson;
 
+enum class TranscriptFormat { ClaudeCode, Codex };
+
+struct TranscriptRoot {
+  fs::path path;
+  TranscriptFormat format = TranscriptFormat::ClaudeCode;
+};
+
 inline fs::path walker_config_path() {
   if (auto home = home_directory())
     return fs::path(*home) / ".claude" / "walker-roots.json";
@@ -35,7 +43,7 @@ inline fs::path walker_config_path() {
 
 // Parse extras from `~/.claude/walker-roots.json`. Returns empty vector on
 // any failure (with a stderr diagnostic for malformed JSON specifically).
-inline std::vector<fs::path> read_extra_roots_from_config() {
+inline std::vector<TranscriptRoot> read_tagged_extra_roots_from_config() {
   fs::path config = walker_config_path();
   std::error_code ec;
   if (!fs::exists(config, ec))
@@ -50,43 +58,111 @@ inline std::vector<fs::path> read_extra_roots_from_config() {
   if (body.empty())
     return {};
 
-  sj::ondemand::parser parser;
+  sj::dom::parser parser;
   sj::padded_string padded(body);
-  sj::ondemand::document doc;
-  if (parser.iterate(padded).get(doc) != sj::SUCCESS) {
+  sj::dom::element doc;
+  if (parser.parse(padded).get(doc) != sj::SUCCESS) {
     std::cerr << "walker: malformed " << config.string()
               << " -- ignoring extra roots\n";
     return {};
   }
-  sj::ondemand::object root;
+  sj::dom::object root;
   if (doc.get_object().get(root) != sj::SUCCESS) {
     std::cerr << "walker: " << config.string()
               << " is not a JSON object -- ignoring\n";
     return {};
   }
 
-  std::vector<fs::path> extras;
-  for (auto field : root) {
-    std::string_view key;
-    if (field.unescaped_key().get(key) != sj::SUCCESS)
-      continue;
-    if (key != "extra_roots")
-      continue;
+  sj::dom::array arr;
+  if (root["extra_roots"].get_array().get(arr) != sj::SUCCESS)
+    return {};
 
-    sj::ondemand::array arr;
-    if (field.value().get_array().get(arr) != sj::SUCCESS)
+  std::vector<TranscriptRoot> extras;
+  for (auto element : arr) {
+    std::string_view path_view;
+    if (element.get_string().get(path_view) == sj::SUCCESS) {
+      if (!path_view.empty())
+        extras.push_back(
+            {fs::path(std::string(path_view)), TranscriptFormat::ClaudeCode});
       continue;
-
-    for (auto element : arr) {
-      std::string_view path_view;
-      if (element.get_string().get(path_view) != sj::SUCCESS)
-        continue;
-      if (path_view.empty())
-        continue;
-      extras.emplace_back(std::string(path_view));
     }
+
+    sj::dom::object tagged;
+    if (element.get_object().get(tagged) != sj::SUCCESS)
+      continue;
+    if (tagged["path"].get_string().get(path_view) != sj::SUCCESS ||
+        path_view.empty())
+      continue;
+    std::string_view format_view;
+    if (tagged["format"].get_string().get(format_view) != sj::SUCCESS)
+      continue;
+    TranscriptFormat format;
+    if (format_view == "claude-code")
+      format = TranscriptFormat::ClaudeCode;
+    else if (format_view == "codex")
+      format = TranscriptFormat::Codex;
+    else
+      continue;
+    extras.push_back({fs::path(std::string(path_view)), format});
   }
   return extras;
+}
+
+inline std::vector<fs::path> read_extra_roots_from_config() {
+  std::vector<fs::path> extras;
+  for (auto &root : read_tagged_extra_roots_from_config()) {
+    if (root.format == TranscriptFormat::ClaudeCode)
+      extras.push_back(std::move(root.path));
+  }
+  return extras;
+}
+
+inline fs::path default_codex_root() {
+  if (auto home = home_directory())
+    return fs::path(*home) / ".codex" / "sessions";
+  return fs::path(".codex/sessions");
+}
+
+inline std::vector<TranscriptRoot>
+resolve_search_roots(const std::optional<fs::path> &primary,
+                     const std::vector<fs::path> &cli_extras,
+                     bool read_config) {
+  const bool using_defaults = !primary.has_value();
+  std::vector<TranscriptRoot> all;
+  all.push_back({primary.value_or(default_projects_root()),
+                 TranscriptFormat::ClaudeCode});
+  if (using_defaults)
+    all.push_back({default_codex_root(), TranscriptFormat::Codex});
+  for (const auto &path : cli_extras)
+    all.push_back({path, TranscriptFormat::ClaudeCode});
+  if (read_config) {
+    for (auto &root : read_tagged_extra_roots_from_config())
+      all.push_back(std::move(root));
+  }
+
+  std::vector<TranscriptRoot> result;
+  std::unordered_set<std::string> seen;
+  for (size_t index = 0; index < all.size(); ++index) {
+    auto &root = all[index];
+    std::error_code ec;
+    if (!fs::is_directory(root.path, ec)) {
+      std::error_code exists_ec;
+      if (index > 0 && fs::exists(root.path, exists_ec)) {
+        std::cerr << "walker: extra root not a directory, skipping: "
+                  << root.path.string() << "\n";
+      }
+      continue;
+    }
+    fs::path canonical = fs::canonical(root.path, ec);
+    if (ec)
+      canonical = root.path.lexically_normal();
+    std::string key(1, root.format == TranscriptFormat::Codex ? 'X' : 'C');
+    key.push_back('\0');
+    key.append(canonical.string());
+    if (seen.insert(key).second)
+      result.push_back(std::move(root));
+  }
+  return result;
 }
 
 // Resolve the effective root list:

@@ -18,6 +18,16 @@ const is_windows = main.is_windows;
 const is_darwin = main.is_darwin;
 const PATH_SEP = main.PATH_SEP;
 
+pub const TranscriptFormat = enum {
+    claude_code,
+    codex,
+};
+
+pub const TranscriptRoot = struct {
+    path: []const u8,
+    format: TranscriptFormat,
+};
+
 /// Return the path to ~/.claude/walker-roots.json (USERPROFILE on Windows).
 /// Falls back to a relative path if neither env var is set. Returns an
 /// arena-allocated string the caller need not free.
@@ -33,6 +43,17 @@ pub fn walkerConfigPath(alloc: Allocator) ![]const u8 {
 /// slice on any failure (with a stderr diagnostic for malformed JSON
 /// specifically). Returned slice + entries are arena-allocated.
 pub fn readExtraRootsFromConfig(alloc: Allocator) ![][]const u8 {
+    const tagged_roots = try readTaggedExtraRootsFromConfig(alloc);
+    var out: std.ArrayList([]const u8) = .empty;
+    for (tagged_roots) |root| {
+        if (root.format == .claude_code) try out.append(alloc, root.path);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// Read config roots with their transcript format. String entries remain
+/// Claude Code roots; object entries must provide both path and format.
+pub fn readTaggedExtraRootsFromConfig(alloc: Allocator) ![]TranscriptRoot {
     const config_path = try walkerConfigPath(alloc);
 
     // Try to read the file. Missing -> silent empty.
@@ -73,17 +94,129 @@ pub fn readExtraRootsFromConfig(alloc: Allocator) ![][]const u8 {
         else => return &.{},
     };
 
-    var out: std.ArrayList([]const u8) = .empty;
+    var out: std.ArrayList(TranscriptRoot) = .empty;
     for (arr.items) |item| {
         switch (item) {
             .string => |s| {
                 if (s.len == 0) continue;
-                try out.append(alloc, try alloc.dupe(u8, s));
+                try out.append(alloc, .{
+                    .path = try alloc.dupe(u8, s),
+                    .format = .claude_code,
+                });
+            },
+            .object => |object| {
+                const path_value = object.get("path") orelse continue;
+                const path = switch (path_value) {
+                    .string => |value| value,
+                    else => continue,
+                };
+                if (path.len == 0) continue;
+                const format_value = object.get("format") orelse continue;
+                const format_string = switch (format_value) {
+                    .string => |value| value,
+                    else => continue,
+                };
+                const format: TranscriptFormat = if (std.mem.eql(u8, format_string, "claude-code"))
+                    .claude_code
+                else if (std.mem.eql(u8, format_string, "codex"))
+                    .codex
+                else
+                    continue;
+                try out.append(alloc, .{
+                    .path = try alloc.dupe(u8, path),
+                    .format = format,
+                });
             },
             else => continue,
         }
     }
     return out.toOwnedSlice(alloc);
+}
+
+pub fn defaultCodexRoot(alloc: Allocator) ![]const u8 {
+    if (main.homeDir(alloc)) |home| {
+        defer alloc.free(home);
+        return std.fmt.allocPrint(alloc, "{s}{c}.codex{c}sessions", .{ home, PATH_SEP, PATH_SEP });
+    }
+    return alloc.dupe(u8, ".codex/sessions");
+}
+
+/// Resolve search roots with transcript format tags. An implicit primary adds
+/// both local Claude Code and Codex defaults. CLI extras remain Claude Code.
+pub fn resolveSearchRoots(
+    alloc: Allocator,
+    primary: ?[]const u8,
+    cli_extras: []const []const u8,
+    read_config: bool,
+) ![]TranscriptRoot {
+    const Entry = struct {
+        root: TranscriptRoot,
+        report_missing: bool,
+    };
+    var combined: std.ArrayList(Entry) = .empty;
+    try combined.append(alloc, .{
+        .root = .{
+            .path = primary orelse try main.defaultRoot(alloc),
+            .format = .claude_code,
+        },
+        .report_missing = false,
+    });
+    if (primary == null) {
+        try combined.append(alloc, .{
+            .root = .{
+                .path = try defaultCodexRoot(alloc),
+                .format = .codex,
+            },
+            .report_missing = false,
+        });
+    }
+    for (cli_extras) |path| {
+        try combined.append(alloc, .{
+            .root = .{ .path = path, .format = .claude_code },
+            .report_missing = true,
+        });
+    }
+    if (read_config) {
+        const config_extras = readTaggedExtraRootsFromConfig(alloc) catch &.{};
+        for (config_extras) |root| {
+            try combined.append(alloc, .{ .root = root, .report_missing = true });
+        }
+    }
+
+    var seen = std.StringHashMap(void).init(alloc);
+    defer seen.deinit();
+    var result: std.ArrayList(TranscriptRoot) = .empty;
+
+    for (combined.items) |entry| {
+        if (!isExistingDir(alloc, entry.root.path)) {
+            if (entry.report_missing) {
+                const msg = try std.fmt.allocPrint(
+                    alloc,
+                    "walker: extra root not a directory, skipping: {s}\n",
+                    .{entry.root.path},
+                );
+                main.writeStderr(msg);
+            }
+            continue;
+        }
+        const canonical = try alloc.dupe(u8, stripTrailingSep(entry.root.path));
+        const format_prefix = switch (entry.root.format) {
+            .claude_code => "claude-code:",
+            .codex => "codex:",
+        };
+        const key = try std.fmt.allocPrint(alloc, "{s}{s}", .{ format_prefix, canonical });
+        const entry_result = try seen.getOrPut(key);
+        if (entry_result.found_existing) {
+            alloc.free(key);
+            alloc.free(canonical);
+            continue;
+        }
+        try result.append(alloc, .{
+            .path = canonical,
+            .format = entry.root.format,
+        });
+    }
+    return result.toOwnedSlice(alloc);
 }
 
 /// Resolve the effective root list:

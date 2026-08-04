@@ -109,6 +109,10 @@ Full contract: SPEC.md in the source tree.
 
 ## Roots
 
+Every root carries a transcript format tag: `claude-code` or `codex`.
+Cost, events, and beacon modes accept only Claude Code roots. Search accepts
+both formats and selects discovery and parsing from the tag.
+
 Every subcommand walks an effective set of project roots assembled as:
 
 1. **Primary root.** From `--projects-root <path>` if given, else
@@ -116,6 +120,12 @@ Every subcommand walks an effective set of project roots assembled as:
 2. **CLI extras.** Zero or more `--extra-projects-root <path>` flags.
 3. **Config extras.** Read from `~/.claude/walker-roots.json` unless
    `--no-config` is passed.
+
+For search only, when `--projects-root` is omitted, a second implicit root is
+added with path `~/.codex/sessions` and format `codex`. Supplying
+`--projects-root` preserves the historical single-primary behavior and tags
+that path `claude-code`. CLI extra roots are also `claude-code`; use a tagged
+config object for an additional Codex root.
 
 ### Home directory
 
@@ -135,14 +145,22 @@ path (`~/.claude/walker-roots.json`) resolves identically across subcommands:
 ```json
 {
   "extra_roots": [
-    "/mnt/chonkers/Users/mtsch/.claude/projects"
+    "/mnt/chonkers/Users/mtsch/.claude/projects",
+    {
+      "path": "/mnt/chonkers/Users/mtsch/.codex/sessions",
+      "format": "codex"
+    }
   ]
 }
 ```
 
-Single key `extra_roots`: array of absolute paths. Per-host; NOT
-synced via memory-sync. Missing file → no extras. Malformed JSON →
-stderr diagnostic, treat as no extras (must NOT error).
+Single key `extra_roots`: array of absolute path strings or tagged root
+objects. A string is backward-compatible shorthand for
+`{"path":"...","format":"claude-code"}`. Object `format` is exactly
+`claude-code` or `codex`; malformed objects and unknown formats are skipped.
+Per-host; NOT synced via memory-sync. Missing file → no extras. Malformed JSON
+→ stderr diagnostic, treat as no extras (must NOT error). Non-search modes
+ignore `codex` roots.
 
 ### Resolution
 
@@ -476,7 +494,7 @@ pattern is an error.
 | `--case-sensitive` | false | Default is case-insensitive (the usual recall case). |
 | `--role <user\|assistant\|both>` | both | Restrict by message role. |
 | `--since <t>` / `--until <t>` | none / now | RFC3339 timestamp or relative (`7d`, `12h`). |
-| `--cwd <slug>` | any | Restrict to one project slug (the `~/.claude/projects/<slug>` dir name). |
+| `--cwd <cwd>` | any | Restrict to one Claude project slug or exact Codex `session_meta.payload.cwd`. |
 | `--context <N>` | 1 | Turns of context before AND after each hit (`0` = hit only). |
 | `--limit <N>` | 50 | Soft cap; overflow sets `truncated` and emits a stderr narrowing hint. |
 | `--count-only` | false | Emit only the summary record — a cheap pre-flight to size a query. |
@@ -485,7 +503,7 @@ pattern is an error.
 | `--format <pretty\|jsonl>` | pretty | `jsonl` is agent-consumable (one record per line). |
 | `--snippet-chars <N>` | 240 | Max snippet preview chars per hit. |
 
-**Discovery.** Search walks parent transcripts
+**Discovery.** For `claude-code` roots, search walks parent transcripts
 (`<root>/<slug>/<sid>.jsonl`) AND subagent transcripts
 (`<root>/<slug>/<session>/subagents/agent-*.jsonl`) in every resolved
 root, mirroring `## Discovery`. A subagent hit reports `session_id` =
@@ -493,6 +511,14 @@ the enclosing session directory name (its parent session), so subagent
 hits group with their parent in `sessions_matched`. `--cwd <slug>`
 restricts both forms; the `--since` mtime fast-path prune applies per
 file to parents and subagents alike.
+
+For `codex` roots, search walks exactly
+`<root>/YYYY/MM/DD/rollout-<iso>-<uuid>.jsonl`; there is no slug directory and
+no subagent layout. The first record must be `type: "session_meta"`. Its
+`payload.session_id` (or legacy `payload.id`) is the result `session_id`, and
+its string `payload.cwd` is the result `cwd_slug` and the exact value matched
+by `--cwd`. Files without valid metadata or without the `rollout-*.jsonl` name
+are skipped.
 
 Filters apply cheapest-first per `## Filters`: file mtime, slug, role,
 tool-block exclusion, time window, then the pattern match.
@@ -502,6 +528,13 @@ user-prompt format) and sometimes an array of content blocks; parse it untyped
 and concatenate the `{"type":"text"}` blocks — strict typed deserialization
 silently drops ~10% of older user prompts. Search reaches `role: user` and
 `role: assistant` messages only.
+
+For Codex, search indexes only `type: "event_msg"` records whose payload is
+`{"type":"user_message","message":"..."}` or
+`{"type":"agent_message","message":"..."}`. They map to roles `user` and
+`assistant`, respectively. Other event types and non-string messages are
+ignored. The record's top-level `timestamp` supplies search ordering and time
+filtering. Claude Code extraction remains unchanged.
 
 **Queue operations.** When you type into the prompt while the agent is busy,
 Claude Code queues the input as a `type: "queue-operation"` entry with no

@@ -8,12 +8,15 @@ use regex::Regex;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::fs::{read_dir, DirEntry};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, UNIX_EPOCH};
 
-use crate::content::{extract_queue_op_text, extract_text, is_only_tool_blocks};
-use crate::{current_unix, default_projects_root, parse_iso8601, walker_roots};
+use crate::content::{
+    extract_codex_event, extract_queue_op_text, extract_text, is_only_tool_blocks,
+};
+use crate::walker_roots::{TranscriptFormat, TranscriptRoot};
+use crate::{current_unix, parse_iso8601, walker_roots};
 
 // === Flag types ===
 
@@ -45,7 +48,7 @@ struct SearchArgs {
     include_queue_ops: bool,
     format: Format,
     snippet_chars: u32,
-    projects_root: PathBuf,
+    projects_root: Option<PathBuf>,
     extra_projects_roots: Vec<PathBuf>,
     read_config: bool,
 }
@@ -199,7 +202,7 @@ fn parse_args(raw: &[String]) -> Result<SearchArgs, String> {
         include_queue_ops,
         format,
         snippet_chars,
-        projects_root: projects_root.unwrap_or_else(default_projects_root),
+        projects_root,
         extra_projects_roots,
         read_config,
     })
@@ -244,6 +247,7 @@ struct ScanMessage {
 
 fn scan_file(
     path: &Path,
+    transcript_format: TranscriptFormat,
     include_queue_ops: bool,
     include_tool_blocks: bool,
     prefilter: Option<&PreFilter>,
@@ -277,6 +281,33 @@ fn scan_file(
             Ok(e) => e,
             Err(_) => continue,
         };
+        if transcript_format == TranscriptFormat::Codex {
+            if entry.get("type").and_then(Value::as_str) != Some("event_msg") {
+                continue;
+            }
+            let Some(payload) = entry.get("payload") else {
+                continue;
+            };
+            let Some((role, text)) = extract_codex_event(payload) else {
+                continue;
+            };
+            let timestamp_str = entry
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let timestamp = parse_iso8601(&timestamp_str);
+            out.push(ScanMessage {
+                line_number: (idx + 1) as u32,
+                timestamp,
+                timestamp_str,
+                role: role.to_string(),
+                text_default: text.clone(),
+                text_with_tools: text,
+                is_only_tool_blocks: false,
+            });
+            continue;
+        }
         // Queue-operation entries have no `message` object: the text lives in a
         // root-level `content` string. Only indexed when --include-queue-ops is
         // set; content-bearing enqueue/popAll surface, empty remove/dequeue are
@@ -365,6 +396,7 @@ struct DiscoveredFile {
     slug: String,
     session_id: String,
     host_root: String,
+    format: TranscriptFormat,
 }
 
 fn mtime_pruned(entry: &DirEntry, since: Option<f64>) -> bool {
@@ -390,14 +422,18 @@ fn mtime_pruned(entry: &DirEntry, since: Option<f64>) -> bool {
 /// session directory's name (the parent session), so its hits group with
 /// the parent in sessions_matched.
 fn discover_files(
-    roots: &[PathBuf],
+    roots: &[TranscriptRoot],
     since: Option<f64>,
     cwd_slug: Option<&str>,
 ) -> Vec<DiscoveredFile> {
     let mut files: Vec<DiscoveredFile> = Vec::new();
     for root in roots {
-        let host_root = root.display().to_string();
-        let slug_entries = match read_dir(root) {
+        if root.format == TranscriptFormat::Codex {
+            discover_codex_files(root, since, cwd_slug, &mut files);
+            continue;
+        }
+        let host_root = root.path.display().to_string();
+        let slug_entries = match read_dir(&root.path) {
             Ok(e) => e,
             Err(_) => continue,
         };
@@ -436,6 +472,7 @@ fn discover_files(
                         slug: slug.clone(),
                         session_id: stem.to_string(),
                         host_root: host_root.clone(),
+                        format: TranscriptFormat::ClaudeCode,
                     });
                 } else if file_type.is_dir() {
                     let sid = entry.file_name().to_string_lossy().to_string();
@@ -460,6 +497,7 @@ fn discover_files(
                             slug: slug.clone(),
                             session_id: sid.clone(),
                             host_root: host_root.clone(),
+                            format: TranscriptFormat::ClaudeCode,
                         });
                     }
                 }
@@ -467,6 +505,100 @@ fn discover_files(
         }
     }
     files
+}
+
+fn discover_codex_files(
+    root: &TranscriptRoot,
+    since: Option<f64>,
+    cwd_filter: Option<&str>,
+    files: &mut Vec<DiscoveredFile>,
+) {
+    for year in codex_directory_entries(&root.path)
+        .into_iter()
+        .filter(|entry| {
+            entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
+                && is_codex_date_component(entry, 4)
+        })
+    {
+        for month in codex_directory_entries(&year.path())
+            .into_iter()
+            .filter(|entry| {
+                entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
+                    && is_codex_date_component(entry, 2)
+            })
+        {
+            for day in codex_directory_entries(&month.path())
+                .into_iter()
+                .filter(|entry| {
+                    entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
+                        && is_codex_date_component(entry, 2)
+                })
+            {
+                for rollout in codex_directory_entries(&day.path())
+                    .into_iter()
+                    .filter(|entry| {
+                        entry
+                            .file_type()
+                            .map(|kind| kind.is_file())
+                            .unwrap_or(false)
+                    })
+                {
+                    let name = rollout.file_name();
+                    let name = name.to_string_lossy();
+                    if !name.starts_with("rollout-")
+                        || !name.ends_with(".jsonl")
+                        || mtime_pruned(&rollout, since)
+                    {
+                        continue;
+                    }
+                    let Some((session_id, cwd)) = read_codex_session_meta(&rollout.path()) else {
+                        continue;
+                    };
+                    if cwd_filter.is_some_and(|wanted| wanted != cwd) {
+                        continue;
+                    }
+                    files.push(DiscoveredFile {
+                        path: rollout.path(),
+                        slug: cwd,
+                        session_id,
+                        host_root: root.path.display().to_string(),
+                        format: TranscriptFormat::Codex,
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn is_codex_date_component(entry: &DirEntry, expected_length: usize) -> bool {
+    let name = entry.file_name();
+    let bytes = name.as_encoded_bytes();
+    bytes.len() == expected_length && bytes.iter().all(u8::is_ascii_digit)
+}
+
+fn read_codex_session_meta(path: &Path) -> Option<(String, String)> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut first = String::new();
+    if BufReader::new(file).read_line(&mut first).ok()? == 0 {
+        return None;
+    }
+    let meta: Value = serde_json::from_str(&first).ok()?;
+    if meta.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return None;
+    }
+    let payload = meta.get("payload")?;
+    let cwd = payload.get("cwd").and_then(Value::as_str)?;
+    let session_id = payload
+        .get("session_id")
+        .or_else(|| payload.get("id"))
+        .and_then(Value::as_str)?;
+    Some((session_id.to_string(), cwd.to_string()))
+}
+
+fn codex_directory_entries(path: &Path) -> Vec<DirEntry> {
+    read_dir(path)
+        .map(|entries| entries.flatten().collect())
+        .unwrap_or_default()
 }
 
 // === Pattern matching ===
@@ -706,6 +838,7 @@ fn process_file(
 ) -> Vec<Hit> {
     let messages = scan_file(
         &file.path,
+        file.format,
         args.include_queue_ops,
         args.include_tool_blocks,
         prefilter,
@@ -903,7 +1036,7 @@ pub fn run(raw: &[String]) {
     };
     let prefilter = PreFilter::build(&args);
 
-    let roots = walker_roots::resolve_roots(
+    let roots = walker_roots::resolve_search_roots(
         args.projects_root.clone(),
         &args.extra_projects_roots,
         args.read_config,
@@ -1119,7 +1252,7 @@ mod tests {
     fn scan_file_open_error_returns_empty() {
         // Covers lines 212-214: File::open Err → return empty vec.
         let missing = PathBuf::from("/nonexistent/path/to/file.jsonl");
-        let msgs = scan_file(&missing, false, false, None);
+        let msgs = scan_file(&missing, TranscriptFormat::ClaudeCode, false, false, None);
         assert!(msgs.is_empty());
     }
 
@@ -1141,11 +1274,17 @@ mod tests {
             r#"{"message":{"role":"user","content":"hi"},"timestamp":"2025-01-01T00:00:00Z"}"#, // good
         ];
         fs::write(&path, lines.join("\n")).unwrap();
-        let msgs = scan_file(&path, false, false, None);
+        let msgs = scan_file(&path, TranscriptFormat::ClaudeCode, false, false, None);
         assert_eq!(msgs.len(), 2); // the empty-content user and the good user line
                                    // First valid message has content "" (line 7); second has "hi".
         assert_eq!(msgs.last().unwrap().text_default, "hi");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn codex_directory_entries_missing_path_is_empty() {
+        assert!(codex_directory_entries(Path::new("/nonexistent/codex-root")).is_empty());
+        assert!(read_codex_session_meta(Path::new("/nonexistent/codex-rollout")).is_none());
     }
 
     #[test]
@@ -1161,10 +1300,14 @@ mod tests {
             .unwrap()
             .as_secs_f64()
             + 1e9;
-        let files = discover_files(std::slice::from_ref(&root), Some(far_future), None);
+        let tagged = TranscriptRoot {
+            path: root.clone(),
+            format: TranscriptFormat::ClaudeCode,
+        };
+        let files = discover_files(std::slice::from_ref(&tagged), Some(far_future), None);
         assert!(files.is_empty());
         // Without a cutoff, the file is discovered.
-        let files2 = discover_files(std::slice::from_ref(&root), None, None);
+        let files2 = discover_files(std::slice::from_ref(&tagged), None, None);
         assert_eq!(files2.len(), 1);
         let _ = fs::remove_dir_all(&root);
     }
@@ -1235,7 +1378,11 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let root = tempdir_path("search-unreadable-root");
         fs::set_permissions(&root, fs::Permissions::from_mode(0o000)).unwrap();
-        let files = discover_files(std::slice::from_ref(&root), None, None);
+        let tagged = TranscriptRoot {
+            path: root.clone(),
+            format: TranscriptFormat::ClaudeCode,
+        };
+        let files = discover_files(std::slice::from_ref(&tagged), None, None);
         fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
         let _ = fs::remove_dir_all(&root);
         assert!(files.is_empty(), "unreadable root should yield no files");
@@ -1249,7 +1396,11 @@ mod tests {
         let root = tempdir_path("search-nondirroot");
         // A plain file directly under root: the slug scan skips it.
         fs::write(root.join("not-a-slug.jsonl"), b"").unwrap();
-        let files = discover_files(std::slice::from_ref(&root), None, None);
+        let tagged = TranscriptRoot {
+            path: root.clone(),
+            format: TranscriptFormat::ClaudeCode,
+        };
+        let files = discover_files(std::slice::from_ref(&tagged), None, None);
         let _ = fs::remove_dir_all(&root);
         assert!(
             files.is_empty(),
@@ -1282,7 +1433,11 @@ mod tests {
         fs::create_dir_all(&good_slug).unwrap();
         fs::write(good_slug.join("session-y.jsonl"), b"").unwrap();
 
-        let files = discover_files(std::slice::from_ref(&root), None, None);
+        let tagged = TranscriptRoot {
+            path: root.clone(),
+            format: TranscriptFormat::ClaudeCode,
+        };
+        let files = discover_files(std::slice::from_ref(&tagged), None, None);
 
         fs::set_permissions(&bad_slug, fs::Permissions::from_mode(0o755)).unwrap();
         let _ = fs::remove_dir_all(&root);
@@ -1309,7 +1464,11 @@ mod tests {
         // Dangling symlink: target does not exist.
         symlink("/nonexistent/ghost.jsonl", slug.join("ghost.jsonl")).unwrap();
 
-        let files = discover_files(std::slice::from_ref(&root), None, None);
+        let tagged = TranscriptRoot {
+            path: root.clone(),
+            format: TranscriptFormat::ClaudeCode,
+        };
+        let files = discover_files(std::slice::from_ref(&tagged), None, None);
         let _ = fs::remove_dir_all(&root);
 
         assert!(

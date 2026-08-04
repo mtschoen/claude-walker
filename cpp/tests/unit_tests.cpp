@@ -182,7 +182,8 @@ void test_unreadable_transcripts() {
   expect(records.empty(), "events walker skips unreadable transcript");
 
   // search scanner: no messages.
-  auto messages = walker::search::scanFile(locked, false, false, nullptr);
+  auto messages = walker::search::scanFile(
+      locked, walker::TranscriptFormat::ClaudeCode, false, false, nullptr);
   expect(messages.empty(), "search scanner skips unreadable transcript");
 
   // cost-mode walker: zero sums.
@@ -205,6 +206,77 @@ void test_nudge_to_whitespace_bounds() {
          "nudge at end returns end");
 }
 
+void test_codex_scan_messages() {
+  fs::path dir = make_temp_dir("codex-scan");
+  fs::path transcript = dir / "rollout-scan.jsonl";
+  write_file(transcript,
+             "{\"type\":\"session_meta\",\"payload\":{\"id\":\"session-a\","
+             "\"cwd\":\"/work/a\"}}\n"
+             "{\"timestamp\":\"2026-05-10T11:01:40.000Z\",\"type\":"
+             "\"event_msg\",\"payload\":{\"type\":\"user_message\","
+             "\"message\":\"needle from user\"}}\n"
+             "{\"timestamp\":\"2026-05-10T11:02:00.000Z\",\"type\":"
+             "\"event_msg\",\"payload\":{\"type\":\"agent_message\","
+             "\"message\":42}}\n"
+             "{\"timestamp\":\"2026-05-10T11:03:00.000Z\",\"type\":"
+             "\"response_item\",\"payload\":{\"type\":\"agent_message\","
+             "\"message\":\"wrong envelope\"}}\n"
+             "{\"timestamp\":\"2026-05-10T11:04:00.000Z\",\"type\":"
+             "\"event_msg\",\"payload\":{\"type\":\"token_count\","
+             "\"message\":\"wrong payload\"}}\n"
+             "{\"timestamp\":\"2026-05-10T11:05:00.000Z\",\"type\":"
+             "\"event_msg\",\"payload\":{\"type\":\"agent_message\","
+             "\"message\":\"needle from agent\"}}\n");
+
+  auto messages = walker::search::scanFile(
+      transcript, walker::TranscriptFormat::Codex, false, false, nullptr);
+  expect(messages.size() == 2,
+         "Codex scanner accepts only string user and agent event messages");
+  if (messages.size() == 2) {
+    expect(messages[0].line_number == 2 && messages[0].role == "user" &&
+               messages[0].text_default == "needle from user",
+           "Codex scanner maps user message fields");
+    expect(messages[1].line_number == 6 && messages[1].role == "assistant" &&
+               messages[1].text_default == "needle from agent",
+           "Codex scanner maps agent message fields");
+  }
+  fs::remove_all(dir);
+}
+
+void test_codex_discovery() {
+  fs::path root = make_temp_dir("codex-discovery");
+  fs::path good = root / "2026" / "05" / "10" / "rollout-good.jsonl";
+  write_file(good, "{\"type\":\"session_meta\",\"payload\":{\"id\":"
+                   "\"session-from-id\",\"cwd\":\"/work/exact\"}}\n");
+  write_file(root / "2026" / "05" / "10" / "not-a-rollout.jsonl",
+             "{\"type\":\"session_meta\",\"payload\":{\"id\":\"bad\","
+             "\"cwd\":\"/work/exact\"}}\n");
+  write_file(root / "2026" / "05" / "rollout-too-shallow.jsonl",
+             "{\"type\":\"session_meta\",\"payload\":{\"id\":\"bad\","
+             "\"cwd\":\"/work/exact\"}}\n");
+  write_file(root / "2026" / "05" / "10" / "rollout-bad-meta.jsonl",
+             "{\"type\":\"event_msg\",\"payload\":{\"id\":\"bad\","
+             "\"cwd\":\"/work/exact\"}}\n");
+
+  walker::TranscriptRoot tagged{root, walker::TranscriptFormat::Codex};
+  std::string exact = "/work/exact";
+  auto files = walker::search::discoverFiles(tagged, std::nullopt, &exact);
+  expect(files.size() == 1,
+         "Codex discovery requires YYYY/MM/DD rollout files and metadata");
+  if (files.size() == 1) {
+    expect(files[0].path == good && files[0].slug == exact &&
+               files[0].session_id == "session-from-id" &&
+               files[0].format == walker::TranscriptFormat::Codex,
+           "Codex discovery reads id alias and cwd from first metadata line");
+  }
+
+  std::string prefix = "/work";
+  auto prefix_files =
+      walker::search::discoverFiles(tagged, std::nullopt, &prefix);
+  expect(prefix_files.empty(), "Codex cwd filtering is exact");
+  fs::remove_all(root);
+}
+
 } // namespace
 
 int main() {
@@ -213,6 +285,8 @@ int main() {
   test_parse_iso8601_separators();
   test_read_environment_variable();
   test_nudge_to_whitespace_bounds();
+  test_codex_scan_messages();
+  test_codex_discovery();
 #ifndef _WIN32
   test_entry_mtime_before_dangling_symlink();
   test_discover_groups_unreadable_dirs();

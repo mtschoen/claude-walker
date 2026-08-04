@@ -64,6 +64,18 @@ pub fn extract_text(content: &Value, include_tool_blocks: bool) -> String {
     result
 }
 
+/// Extract a searchable role and message from a Codex `event_msg` payload.
+/// Other event kinds and wrong-typed messages are intentionally ignored.
+pub fn extract_codex_event(payload: &Value) -> Option<(&'static str, String)> {
+    let role = match payload.get("type").and_then(Value::as_str)? {
+        "user_message" => "user",
+        "agent_message" => "assistant",
+        _ => return None,
+    };
+    let message = payload.get("message").and_then(Value::as_str)?;
+    Some((role, message.to_string()))
+}
+
 /// True when content is an array entirely composed of `tool_use`/`tool_result`
 /// blocks (no text blocks). Search uses this to skip pure tool messages under
 /// default rules. Returns false for bare-string content (legacy form is always
@@ -153,6 +165,26 @@ mod tests {
             {"type": "tool_result", "content": "bare-string-result"}
         ]);
         assert_eq!(extract_text(&content, true), "bare-string-result");
+    }
+
+    #[test]
+    fn extract_codex_event_accepts_messages_and_skips_other_payloads() {
+        assert_eq!(
+            extract_codex_event(&json!({"type":"user_message","message":"hello"})),
+            Some(("user", "hello".to_string()))
+        );
+        assert_eq!(
+            extract_codex_event(&json!({"type":"agent_message","message":"answer"})),
+            Some(("assistant", "answer".to_string()))
+        );
+        assert_eq!(
+            extract_codex_event(&json!({"type":"token_count","message":"x"})),
+            None
+        );
+        assert_eq!(
+            extract_codex_event(&json!({"type":"agent_message","message":42})),
+            None
+        );
     }
 
     #[test]

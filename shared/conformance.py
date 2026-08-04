@@ -40,6 +40,7 @@ BEACON_CORPUS = ROOT / "shared" / "corpus" / "beacons"
 MULTI_ROOT_CORPUS = ROOT / "shared" / "corpus" / "multi_root"
 SEARCH_CORPUS = ROOT / "shared" / "corpus" / "search"
 SEARCH_MULTI_ROOT_CORPUS = ROOT / "shared" / "corpus" / "search_multi_root"
+SEARCH_CODEX_CORPUS = ROOT / "shared" / "corpus" / "search_codex"
 EVENTS_CORPUS = ROOT / "shared" / "corpus" / "events"
 EVENTS_EXPECTED = EVENTS_CORPUS / "expected_events.json"
 EXPECTED_LATEST = BEACON_CORPUS / "expected_latest.json"
@@ -53,6 +54,20 @@ EVENTS_TS_TOLERANCE = 1e-6
 SEARCH_HIT_STRIP_KEYS = {"host_root", "file_path"}
 # Summary fields that vary per run — strip before compare.
 SEARCH_SUMMARY_STRIP_KEYS = {"elapsed_ms", "files_walked"}
+
+
+def strip_search_hit(record: dict) -> dict:
+    value = dict(record)
+    for key in SEARCH_HIT_STRIP_KEYS:
+        value.pop(key, None)
+    return value
+
+
+def strip_search_summary(record: dict) -> dict:
+    value = dict(record)
+    for key in SEARCH_SUMMARY_STRIP_KEYS:
+        value.pop(key, None)
+    return value
 
 # Impls that have implemented the `search` subcommand. Add languages here as
 # their search ports land. Until the set contains an impl, its search check
@@ -988,6 +1003,145 @@ def check_events(lang: str, binary: Path) -> bool:
             print(f"        {first_diff}")
             all_ok = False
 
+    return all_ok
+
+
+def check_search_codex(lang: str, binary: Path) -> bool:
+    """Codex default discovery plus cwd filtering and tagged config roots."""
+    expected_file = SEARCH_CODEX_CORPUS / "expected.json"
+    if not expected_file.is_file() or lang not in IMPLS_WITH_SEARCH:
+        return True
+    expected = json.loads(expected_file.read_text(encoding="utf-8"))
+    all_ok = True
+    cases = (
+        ("all", "all", []),
+        ("cwd_filtered", "cwd_filtered", ["--cwd", expected["cwd"]]),
+        ("since_mtime_pruned", "cwd_filtered", ["--since", "1h"]),
+    )
+    for case_name, expected_key, flags in cases:
+        with tempfile.TemporaryDirectory(prefix="walker-search-codex-") as home:
+            home_path = Path(home)
+            (home_path / ".claude" / "projects").mkdir(parents=True)
+            shutil.copytree(SEARCH_CODEX_CORPUS, home_path / ".codex" / "sessions")
+            if case_name == "all":
+                large_rollout = (
+                    home_path / ".codex" / "sessions" / "2026" / "05" / "09"
+                    / "rollout-large-no-hit.jsonl"
+                )
+                metadata = {
+                    "type": "session_meta",
+                    "padding": "x" * 8192,
+                    "payload": {
+                        "session_id": "large-no-hit",
+                        "cwd": "/worktrees/large-no-hit",
+                    },
+                }
+                large_rollout.write_bytes(
+                    json.dumps(metadata).encode("utf-8") + b"\n" + b" " * 1_048_576
+                )
+            invalid_extra = home_path / "invalid-extra"
+            invalid_extra.write_text("not a directory", encoding="utf-8")
+            if case_name == "since_mtime_pruned":
+                old_rollout = next(
+                    (home_path / ".codex" / "sessions").glob(
+                        "2026/05/09/rollout-2026-05-09T10-*.jsonl"
+                    )
+                )
+                os.utime(old_rollout, (expected["_meta"]["now_unix"] - 7200,) * 2)
+            env = dict(os.environ)
+            env["HOME"] = str(home_path)
+            env["USERPROFILE"] = str(home_path)
+            cmd = [
+                str(binary), "search", expected["pattern"], *flags,
+                "--now", repr(expected["_meta"]["now_unix"]),
+                "--format", "jsonl", "--context", "0", "--no-config",
+                "--extra-projects-root", str(invalid_extra),
+            ]
+            result = run_captured(cmd, text=True, encoding="utf-8", timeout=10, env=env)
+        try:
+            records = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+            hits = [strip_search_hit(x) for x in records if x.get("type") == "hit"]
+            summary_record = next(x for x in records if x.get("type") == "summary")
+            large_rollout_ok = (
+                case_name != "all" or summary_record.get("files_walked") == 3
+            )
+            summary_value = strip_search_summary(summary_record)
+            ok = (result.returncode == 0 and hits == expected[expected_key]["hits"]
+                  and summary_value == expected[expected_key]["summary"]
+                  and large_rollout_ok)
+        except Exception:
+            ok = False
+            hits = []
+            summary_value = None
+        print(f"  [{lang:>4s}] search-codex/{case_name:34s} {' OK ' if ok else 'FAIL'}")
+        if not ok:
+            print(f"        exit={result.returncode} hits={hits!r} summary={summary_value!r} stderr={result.stderr!r}")
+            all_ok = False
+
+    # A tagged config root must select codex discovery even when the explicit
+    # primary is an empty Claude root. String entries remain Claude-format.
+    with tempfile.TemporaryDirectory(prefix="walker-search-codex-config-") as home:
+        home_path = Path(home)
+        primary = home_path / "empty-claude"
+        primary.mkdir()
+        tagged = home_path / "mounted-codex"
+        shutil.copytree(SEARCH_CODEX_CORPUS, tagged)
+        config_dir = home_path / ".claude"
+        config_dir.mkdir()
+        (config_dir / "walker-roots.json").write_text(json.dumps({
+            "extra_roots": [{"path": str(tagged), "format": "codex"}]
+        }), encoding="utf-8")
+        env = dict(os.environ)
+        env["HOME"] = str(home_path)
+        env["USERPROFILE"] = str(home_path)
+        cmd = [
+            str(binary), "search", expected["pattern"],
+            "--projects-root", str(primary), "--cwd", expected["cwd"],
+            "--now", repr(expected["_meta"]["now_unix"]), "--format", "jsonl",
+            "--context", "0",
+        ]
+        result = run_captured(cmd, text=True, encoding="utf-8", timeout=10, env=env)
+        try:
+            records = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+            hits = [strip_search_hit(x) for x in records if x.get("type") == "hit"]
+            summary_value = strip_search_summary(next(x for x in records if x.get("type") == "summary"))
+            ok = (result.returncode == 0 and hits == expected["cwd_filtered"]["hits"]
+                  and summary_value == expected["cwd_filtered"]["summary"])
+        except Exception:
+            ok = False
+        print(f"  [{lang:>4s}] search-codex/{'tagged-config-root':34s} {' OK ' if ok else 'FAIL'}")
+        if not ok:
+            all_ok = False
+
+    # With both home variables empty, defaults are relative to the process
+    # working directory. This is the empty-home CI fallback for both formats.
+    with tempfile.TemporaryDirectory(prefix="walker-search-codex-relative-") as working:
+        working_path = Path(working)
+        (working_path / ".claude" / "projects").mkdir(parents=True)
+        shutil.copytree(SEARCH_CODEX_CORPUS, working_path / ".codex" / "sessions")
+        env = dict(os.environ)
+        env.pop("HOME", None)
+        env.pop("USERPROFILE", None)
+        cmd = [
+            str(binary), "search", expected["pattern"],
+            "--now", repr(expected["_meta"]["now_unix"]),
+            "--format", "jsonl", "--context", "0", "--no-config",
+        ]
+        result = run_captured(
+            cmd, cwd=str(working_path), text=True, encoding="utf-8",
+            timeout=10, env=env,
+        )
+        try:
+            records = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+            hits = [strip_search_hit(x) for x in records if x.get("type") == "hit"]
+            summary_value = strip_search_summary(next(x for x in records if x.get("type") == "summary"))
+            ok = (result.returncode == 0 and hits == expected["all"]["hits"]
+                  and summary_value == expected["all"]["summary"])
+        except Exception:
+            ok = False
+        print(f"  [{lang:>4s}] search-codex/{'relative-home-fallback':34s} {' OK ' if ok else 'FAIL'}")
+        if not ok:
+            all_ok = False
     return all_ok
 
 
@@ -2018,7 +2172,7 @@ def check_discovery_oddities(lang: str, binary: Path, expected: dict) -> bool:
         shutil.copy(agent_src, sub / "agent-odd.jsonl")
         missing_extra = root / "does-not-exist"
         try:
-            got = run_walker(lang, binary, meta, root, extras=[missing_extra])
+            got = run_walker(lang, binary, meta, root, extras=[missing_extra, root])
             ok, _, _ = within_tolerance(got, target)
             print(f"  [{lang:>4s}] {label:38s} {' OK ' if ok else 'FAIL'}")
             if not ok:
@@ -2492,6 +2646,8 @@ def main():
         if not check_search_multi_root(lang, binary):
             overall_ok = False
         if not check_search_duplicate_root(lang, binary):
+            overall_ok = False
+        if not check_search_codex(lang, binary):
             overall_ok = False
         if not check_events(lang, binary):
             overall_ok = False

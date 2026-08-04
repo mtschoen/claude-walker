@@ -251,6 +251,76 @@ pub fn readEntireFile(alloc: Allocator, path: []const u8) ![]u8 {
     return buf.toOwnedSlice(alloc) catch buf.items;
 }
 
+const FirstLineReader = struct {
+    context: *anyopaque,
+    readFn: *const fn (*anyopaque, []u8) anyerror!usize,
+
+    fn read(self: FirstLineReader, buffer: []u8) !usize {
+        return self.readFn(self.context, buffer);
+    }
+};
+
+const PlatformFileReader = struct {
+    file: PlatformFd,
+
+    fn read(context: *anyopaque, buffer: []u8) !usize {
+        const self: *PlatformFileReader = @ptrCast(@alignCast(context));
+        return fileRead(self.file, buffer);
+    }
+};
+
+fn readFirstLineFromReader(alloc: Allocator, reader: FirstLineReader) ![]u8 {
+    var line: std.ArrayList(u8) = .empty;
+    var read_buffer: [4096]u8 = undefined;
+    while (true) {
+        const count = try reader.read(&read_buffer);
+        if (count == 0) break;
+        const chunk = read_buffer[0..count];
+        if (std.mem.indexOfScalar(u8, chunk, '\n')) |newline| {
+            try line.appendSlice(alloc, chunk[0..newline]);
+            break;
+        }
+        try line.appendSlice(alloc, chunk);
+    }
+    return line.toOwnedSlice(alloc);
+}
+
+pub fn readFirstLine(alloc: Allocator, path: []const u8) ![]u8 {
+    var platform_reader: PlatformFileReader = .{ .file = try fileOpen(alloc, path) };
+    defer fileClose(platform_reader.file);
+    return readFirstLineFromReader(alloc, .{
+        .context = &platform_reader,
+        .readFn = PlatformFileReader.read,
+    });
+}
+
+const CountingFirstLineReader = struct {
+    position: usize = 0,
+    bytes_read: usize = 0,
+
+    fn read(context: *anyopaque, buffer: []u8) !usize {
+        const self: *CountingFirstLineReader = @ptrCast(@alignCast(context));
+        for (buffer, 0..) |*byte, index| {
+            const position = self.position + index;
+            byte.* = if (position == 8192) '\n' else if (position < 8192) 'x' else 'b';
+        }
+        self.position += buffer.len;
+        self.bytes_read += buffer.len;
+        return buffer.len;
+    }
+};
+
+test "first-line reader stops near metadata newline" {
+    var source: CountingFirstLineReader = .{};
+    const line = try readFirstLineFromReader(std.testing.allocator, .{
+        .context = &source,
+        .readFn = CountingFirstLineReader.read,
+    });
+    defer std.testing.allocator.free(line);
+    try std.testing.expectEqual(@as(usize, 8192), line.len);
+    try std.testing.expectEqual(@as(usize, 12288), source.bytes_read);
+}
+
 // ─── mtime filter ────────────────────────────────────────────────────────────
 
 fn mtimeOk(alloc: Allocator, path: []const u8, earliest: f64) bool {
