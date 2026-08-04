@@ -1,4 +1,4 @@
-# claude-walker — Interface & Correctness Spec
+# agent-walker — Interface & Correctness Spec
 
 Every implementation in this repo MUST honor this spec. The conformance
 harness (`shared/conformance.py`) verifies it.
@@ -54,7 +54,7 @@ subcommand) the stderr diagnostic is followed by a pointer line:
 
 ```
 walker: --period is required
-Run 'claude-walker --help' for usage.
+Run 'agent-walker --help' for usage.
 ```
 
 ### Help & usage
@@ -78,10 +78,10 @@ asserts only structure: exit 0, and stdout containing `USAGE`, every
 subcommand name, and `--period`. The reference text:
 
 ```
-claude-walker - fast cost & progress walker over Claude Code transcripts
+agent-walker - fast cost & progress walker over Claude Code transcripts
 
 USAGE:
-    claude-walker [SUBCOMMAND] [OPTIONS]
+    agent-walker [SUBCOMMAND] [OPTIONS]
 
 With no subcommand it runs `cost` (back-compat for the status line).
 
@@ -598,8 +598,10 @@ under `summary.providers`. It is the only MCP search tool; callers scope it with
 This aggregation boundary is search-only. Cost, events, beacons, active-session
 tracking, and every native bare-flag invocation remain Claude-specific.
 
-- **Binary discovery** (first hit wins): `$CLAUDE_WALKER_BINARY`,
-  `~/.claude/walker[.exe]`, `~/.local/bin/claude-walker[.exe]`, then `PATH`.
+- **Binary discovery** (first hit wins): `$AGENT_WALKER_BINARY`,
+  `$CLAUDE_WALKER_BINARY` (deprecated alias), `~/.claude/walker[.exe]`,
+  `~/.local/bin/agent-walker[.exe]`, `~/.local/bin/claude-walker[.exe]`
+  (deprecated alias), then `PATH`.
 - **Claude provider:** subprocesses `walker search ... --format jsonl`, retaining
   native multi-root and mounted-host behavior.
 - **OpenCode provider:** opens `~/.local/share/opencode/opencode.db` read-only,

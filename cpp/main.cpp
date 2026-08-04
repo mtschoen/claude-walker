@@ -49,10 +49,10 @@ struct Args {
 };
 
 static const char *const HELP =
-    R"(claude-walker - fast cost & progress walker over Claude Code transcripts
+    R"(agent-walker - fast cost & progress walker over Claude Code transcripts
 
 USAGE:
-    claude-walker [SUBCOMMAND] [OPTIONS]
+    agent-walker [SUBCOMMAND] [OPTIONS]
 
 With no subcommand it runs `cost` (back-compat for the status line).
 
@@ -102,7 +102,7 @@ static bool wants_help(const std::vector<std::string> &raw) {
 
 [[noreturn]] static void die(std::string_view message) {
   std::cerr << "walker: " << message << "\n";
-  std::cerr << "Run 'claude-walker --help' for usage.\n";
+  std::cerr << "Run 'agent-walker --help' for usage.\n";
   std::exit(2);
 }
 
@@ -298,7 +298,7 @@ int main(int argc, char *argv[]) {
       rest = raw; // bare-flag -> cost mode
     } else {
       std::cerr << "walker: unknown subcommand: " << first << "\n";
-      std::cerr << "Run 'claude-walker --help' for usage.\n";
+      std::cerr << "Run 'agent-walker --help' for usage.\n";
       return 2;
     }
   }

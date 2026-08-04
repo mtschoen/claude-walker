@@ -25,10 +25,10 @@ const SUBCOMMANDS: [&str; 5] = [
     "events",
 ];
 
-const HELP: &str = r#"claude-walker - fast cost & progress walker over Claude Code transcripts
+const HELP: &str = r#"agent-walker - fast cost & progress walker over Claude Code transcripts
 
 USAGE:
-    claude-walker [SUBCOMMAND] [OPTIONS]
+    agent-walker [SUBCOMMAND] [OPTIONS]
 
 With no subcommand it runs `cost` (back-compat for the status line).
 
@@ -72,7 +72,7 @@ fn wants_help(raw: &[String]) -> bool {
 }
 
 fn usage_pointer() {
-    eprintln!("Run 'claude-walker --help' for usage.");
+    eprintln!("Run 'agent-walker --help' for usage.");
 }
 
 #[derive(Default)]

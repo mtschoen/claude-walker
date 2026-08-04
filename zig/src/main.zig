@@ -493,7 +493,7 @@ pub fn grab(argv: [][]const u8, i: *usize, flag: []const u8) []const u8 {
 }
 
 pub fn usagePointer() void {
-    std.debug.print("Run 'claude-walker --help' for usage.\n", .{});
+    std.debug.print("Run 'agent-walker --help' for usage.\n", .{});
 }
 
 pub fn die(msg: []const u8) noreturn {
@@ -503,10 +503,10 @@ pub fn die(msg: []const u8) noreturn {
 }
 
 const HELP =
-    \\claude-walker - fast cost & progress walker over Claude Code transcripts
+    \\agent-walker - fast cost & progress walker over Claude Code transcripts
     \\
     \\USAGE:
-    \\    claude-walker [SUBCOMMAND] [OPTIONS]
+    \\    agent-walker [SUBCOMMAND] [OPTIONS]
     \\
     \\With no subcommand it runs `cost` (back-compat for the status line).
     \\

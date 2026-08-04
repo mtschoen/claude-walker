@@ -1,6 +1,7 @@
 @echo off
-REM Build the C++ walker and install as claude-walker.exe at %USERPROFILE%\.local\bin,
-REM then register the search MCP server.
+REM Build the C++ walker and install as agent-walker.exe at %USERPROFILE%\.local\bin
+REM (with a claude-walker.exe copy kept as a back-compat alias for existing
+REM callers), then register the search MCP server.
 REM
 REM Usage: install.bat [--project [DIR]]
 REM   (no flag)        register the MCP server at `user` scope (global, every project)
@@ -52,11 +53,15 @@ goto :error
 :found
 set "INSTALL_DIR=%USERPROFILE%\.local\bin"
 if not exist "%INSTALL_DIR%" mkdir "%INSTALL_DIR%"
+copy /Y "%WALKER_BIN%" "%INSTALL_DIR%\agent-walker.exe" >nul || goto :error
+REM claude-walker.exe is a deprecated back-compat alias for existing callers
+REM (progress-beacon hooks, statusline lookups). Remove once every consumer
+REM has migrated to the agent-walker name.
 copy /Y "%WALKER_BIN%" "%INSTALL_DIR%\claude-walker.exe" >nul || goto :error
-echo installed %WALKER_BIN% -^> %INSTALL_DIR%\claude-walker.exe
+echo installed %WALKER_BIN% -^> %INSTALL_DIR%\agent-walker.exe ^(alias: claude-walker.exe^)
 
 REM Smoke test: bare-flag invocation routes to cost mode.
-"%INSTALL_DIR%\claude-walker.exe" --period 86400 --win-start 0 >nul || goto :smoke_failed
+"%INSTALL_DIR%\agent-walker.exe" --period 86400 --win-start 0 >nul || goto :smoke_failed
 echo smoke test ok
 
 REM Warn only if INSTALL_DIR isn't on the PERSISTED PATH (User or Machine).
@@ -171,7 +176,8 @@ REM chars, dropping the tail. The PowerShell user-scope SetEnvironmentVariable
 REM below reads only the user PATH and has no length cap.
 echo.
 echo Note: %INSTALL_DIR% is not on PATH. Add it before the recency-nudge
-echo hook or status line can find claude-walker by name. To add it to your
+echo hook or status line can find agent-walker (or its claude-walker alias)
+echo by name. To add it to your
 echo User PATH safely (no setx 1024-char truncation, no system/user merge):
 echo   powershell -NoProfile -Command "$p=[Environment]::GetEnvironmentVariable('Path','User'); if(-not $p){$p=''}; if(($p -split ';') -notcontains '%INSTALL_DIR%'){[Environment]::SetEnvironmentVariable('Path',($p.TrimEnd(';')+';%INSTALL_DIR%').TrimStart(';'),'User')}"
 echo Or edit it via the GUI: rundll32 sysdm.cpl,EditEnvironmentVariables

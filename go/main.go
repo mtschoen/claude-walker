@@ -19,10 +19,10 @@ import (
 
 const version = "go/0.1.1"
 
-const helpText = `claude-walker - fast cost & progress walker over Claude Code transcripts
+const helpText = `agent-walker - fast cost & progress walker over Claude Code transcripts
 
 USAGE:
-    claude-walker [SUBCOMMAND] [OPTIONS]
+    agent-walker [SUBCOMMAND] [OPTIONS]
 
 With no subcommand it runs ` + "`cost`" + ` (back-compat for the status line).
 
@@ -566,7 +566,7 @@ func main() {
 		// an error; bare flag invocation falls through to cost.
 		if !strings.HasPrefix(first, "-") {
 			fmt.Fprintf(os.Stderr, "walker: unknown subcommand: %s\n", first)
-			fmt.Fprintln(os.Stderr, "Run 'claude-walker --help' for usage.")
+			fmt.Fprintln(os.Stderr, "Run 'agent-walker --help' for usage.")
 			os.Exit(2)
 		}
 	}
@@ -579,7 +579,7 @@ func runCost(rawArgs []string) {
 	args, err := parseArguments(rawArgs)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "walker: %v\n", err)
-		fmt.Fprintln(os.Stderr, "Run 'claude-walker --help' for usage.")
+		fmt.Fprintln(os.Stderr, "Run 'agent-walker --help' for usage.")
 		os.Exit(2)
 	}
 

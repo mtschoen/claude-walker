@@ -1,9 +1,12 @@
 # agent-walker - agent instructions
 
 Renamed from claude-walker when it moved into schoen-lab/satellites
-(2026-06-11). The installed binary, `CLAUDE_WALKER_BINARY` env var, and CLI
-help text keep the `claude-walker` name; only the repo and the MCP server
-registration are `agent-walker`.
+(2026-06-11). As of 2026-08-03 the binary's own identity caught up: the
+installed binary, `AGENT_WALKER_BINARY` env var, and CLI help text are now
+`agent-walker`. `claude-walker` is kept everywhere as a deprecated back-compat
+alias (a second copied binary from `install.{sh,bat}`, and `CLAUDE_WALKER_BINARY`
+still honored as an env var fallback) so existing callers (progress-beacon
+hooks, statusline binary lookups) keep working unchanged.
 
 A native walker over Claude Code transcript JSONLs. Used by the
 agent-statusline status line to answer two questions fast:
@@ -242,10 +245,12 @@ are documented inline in `cpp/main.cpp`.
 ## Install
 
 `bash install.sh` (Linux/git-bash) or `install.bat` (cmd) builds the
-C++ impl and copies the binary as `claude-walker(.exe)` to
-`~/.local/bin/`. Status-line + hook callers look it up by that name.
-The script smoke-tests the bare-flag cost-mode invocation before
-exiting and warns if `~/.local/bin` isn't on PATH.
+C++ impl and copies the binary as `agent-walker(.exe)` to `~/.local/bin/`,
+with a second copy installed as `claude-walker(.exe)` — a deprecated
+back-compat alias for callers that still look it up by the old name
+(progress-beacon hooks, statusline binary discovery). The script
+smoke-tests the primary `agent-walker` binary's bare-flag cost-mode
+invocation before exiting and warns if `~/.local/bin` isn't on PATH.
 
 It also registers the `search` MCP server (`mcp/server.py`) via
 `claude mcp add`:
