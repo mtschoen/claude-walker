@@ -86,6 +86,112 @@ func TestReadExtraRootsHappyPath(t *testing.T) {
 	}
 }
 
+func TestReadTaggedExtraRootsSupportsCodexObjects(t *testing.T) {
+	dir := t.TempDir()
+	claudeDir := filepath.Join(dir, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"extra_roots":["/tmp/string",{"path":"/tmp/codex","format":"codex"},{"path":"/tmp/claude","format":"claude-code"},{"path":"/tmp/ignored","format":"unknown"},42]}`
+	if err := os.WriteFile(filepath.Join(claudeDir, "walker-roots.json"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", dir)
+	t.Setenv("USERPROFILE", "")
+
+	tagged := readTaggedExtraRootsFromConfig()
+	want := []transcriptRoot{
+		{Path: "/tmp/string", Format: transcriptFormatClaudeCode},
+		{Path: "/tmp/codex", Format: transcriptFormatCodex},
+		{Path: "/tmp/claude", Format: transcriptFormatClaudeCode},
+	}
+	if len(tagged) != len(want) {
+		t.Fatalf("tagged roots = %+v; want %+v", tagged, want)
+	}
+	for i := range want {
+		if tagged[i] != want[i] {
+			t.Errorf("tagged[%d] = %+v; want %+v", i, tagged[i], want[i])
+		}
+	}
+
+	plain := ReadExtraRootsFromConfig()
+	if len(plain) != 2 || plain[0] != "/tmp/string" || plain[1] != "/tmp/claude" {
+		t.Fatalf("plain config roots = %v; want Claude roots only", plain)
+	}
+}
+
+func TestReadTaggedExtraRootsRejectsWrongExtraRootsShape(t *testing.T) {
+	dir := t.TempDir()
+	claudeDir := filepath.Join(dir, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(claudeDir, "walker-roots.json"),
+		[]byte(`{"extra_roots":"not-an-array"}`),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", dir)
+	t.Setenv("USERPROFILE", "")
+	if got := readTaggedExtraRootsFromConfig(); got != nil {
+		t.Fatalf("wrong-shaped extra_roots returned %+v; want nil", got)
+	}
+}
+
+func TestDefaultCodexRootFallback(t *testing.T) {
+	t.Setenv("HOME", "")
+	t.Setenv("USERPROFILE", "")
+	if got := defaultCodexRoot(); got != filepath.Join(".codex", "sessions") {
+		t.Fatalf("defaultCodexRoot() = %q", got)
+	}
+}
+
+func TestResolveSearchRootsAddsCodexOnlyForDefaultPrimary(t *testing.T) {
+	home := t.TempDir()
+	claudeRoot := filepath.Join(home, ".claude", "projects")
+	codexRoot := filepath.Join(home, ".codex", "sessions")
+	explicitRoot := filepath.Join(home, "explicit")
+	cliRoot := filepath.Join(home, "cli")
+	for _, root := range []string{claudeRoot, codexRoot, explicitRoot, cliRoot} {
+		if err := os.MkdirAll(root, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+
+	defaults := ResolveSearchRoots(defaultProjectsRoot(), false, []string{cliRoot}, false)
+	wantDefaults := []transcriptRoot{
+		{Path: claudeRoot, Format: transcriptFormatClaudeCode},
+		{Path: codexRoot, Format: transcriptFormatCodex},
+		{Path: cliRoot, Format: transcriptFormatClaudeCode},
+	}
+	if len(defaults) != len(wantDefaults) {
+		t.Fatalf("default search roots = %+v; want %+v", defaults, wantDefaults)
+	}
+	for i := range wantDefaults {
+		if defaults[i] != wantDefaults[i] {
+			t.Errorf("defaults[%d] = %+v; want %+v", i, defaults[i], wantDefaults[i])
+		}
+	}
+
+	explicit := ResolveSearchRoots(explicitRoot, true, nil, false)
+	if len(explicit) != 1 || explicit[0] != (transcriptRoot{Path: explicitRoot, Format: transcriptFormatClaudeCode}) {
+		t.Fatalf("explicit search roots = %+v; want explicit Claude root only", explicit)
+	}
+}
+
+func TestResolveSearchRootsSkipsInvalidExtra(t *testing.T) {
+	primary := t.TempDir()
+	invalid := filepath.Join(t.TempDir(), "missing")
+	got := ResolveSearchRoots(primary, true, []string{invalid}, false)
+	if len(got) != 1 || got[0].Path != primary {
+		t.Fatalf("search roots = %+v; want primary only", got)
+	}
+}
+
 // TestReadExtraRootsMalformedJSON covers the json.Unmarshal err branch
 // (stderr diagnostic, returns nil).
 func TestReadExtraRootsMalformedJSON(t *testing.T) {

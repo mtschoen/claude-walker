@@ -34,7 +34,7 @@ const SearchArgs = struct {
     include_queue_ops: bool,
     format: Format,
     snippet_chars: u32,
-    projects_root: []const u8,
+    projects_root: ?[]const u8,
     extra_roots: [][]const u8,
     read_config: bool,
     now_unix: f64,
@@ -178,7 +178,7 @@ fn parseArgs(alloc: Allocator, raw: [][]const u8) !SearchArgs {
         .include_queue_ops = include_queue_ops,
         .format = format,
         .snippet_chars = snippet_chars,
-        .projects_root = projects_root orelse try main.defaultRoot(alloc),
+        .projects_root = projects_root,
         .extra_roots = try extra_roots.toOwnedSlice(alloc),
         .read_config = read_config,
         .now_unix = now,
@@ -710,7 +710,12 @@ const ScanMessage = struct {
     is_only_tool_blocks: bool,
 };
 
-fn scanFile(alloc: Allocator, path: []const u8, include_queue_ops: bool) ![]ScanMessage {
+fn scanFile(
+    alloc: Allocator,
+    path: []const u8,
+    transcript_format: walker_roots.TranscriptFormat,
+    include_queue_ops: bool,
+) ![]ScanMessage {
     const data = main.readEntireFile(alloc, path) catch return alloc.alloc(ScanMessage, 0);
     // Don't free `data`: slices into it (timestamp_str, role) live on in the
     // returned ScanMessages until the arena reclaims them. With an arena
@@ -729,11 +734,67 @@ fn scanFile(alloc: Allocator, path: []const u8, include_queue_ops: bool) ![]Scan
         // A malformed line is skipped, never the whole file (SPEC: malformed
         // JSONL lines are skipped) -- propagating the parse error here used
         // to abandon every line of the file, hits included.
-        if (parseScanMessage(alloc, line, idx, include_queue_ops) catch null) |m| {
+        const message = if (transcript_format == .codex)
+            parseCodexScanMessage(alloc, line, idx) catch null
+        else
+            parseScanMessage(alloc, line, idx, include_queue_ops) catch null;
+        if (message) |m| {
             try out.append(alloc, m);
         }
     }
     return out.toOwnedSlice(alloc);
+}
+
+/// Parse the searchable subset of a Codex rollout event. Only event_msg
+/// user_message and agent_message payloads with string messages are indexed.
+fn parseCodexScanMessage(alloc: Allocator, line: []const u8, idx: u32) !?ScanMessage {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, line, .{});
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |value| value,
+        else => return null,
+    };
+    const entry_type = switch (object.get("type") orelse return null) {
+        .string => |value| value,
+        else => return null,
+    };
+    if (!std.mem.eql(u8, entry_type, "event_msg")) return null;
+    const payload = switch (object.get("payload") orelse return null) {
+        .object => |value| value,
+        else => return null,
+    };
+    const event_type = switch (payload.get("type") orelse return null) {
+        .string => |value| value,
+        else => return null,
+    };
+    const role = if (std.mem.eql(u8, event_type, "user_message"))
+        "user"
+    else if (std.mem.eql(u8, event_type, "agent_message"))
+        "assistant"
+    else
+        return null;
+    const message = switch (payload.get("message") orelse return null) {
+        .string => |value| value,
+        else => return null,
+    };
+    const timestamp_string = if (object.get("timestamp")) |timestamp_value|
+        switch (timestamp_value) {
+            .string => |value| value,
+            else => "",
+        }
+    else
+        "";
+    const text = try alloc.dupe(u8, message);
+    const timestamp = try alloc.dupe(u8, timestamp_string);
+    return .{
+        .line_number = idx,
+        .timestamp = if (timestamp.len == 0) null else main.parseTs(timestamp) catch null,
+        .timestamp_str = timestamp,
+        .role = role,
+        .text_default = text,
+        .text_with_tools = text,
+        .is_only_tool_blocks = false,
+    };
 }
 
 /// Single-pass Scanner walk that produces both `text_default` and
@@ -997,11 +1058,12 @@ const DiscoveredFile = struct {
     slug: []const u8,
     session_id: []const u8,
     host_root: []const u8,
+    format: walker_roots.TranscriptFormat = .claude_code,
 };
 
 fn discoverFiles(
     alloc: Allocator,
-    roots: []const []const u8,
+    roots: []const walker_roots.TranscriptRoot,
     since: ?f64,
     cwd_filter: ?[]const u8,
 ) ![]DiscoveredFile {
@@ -1010,15 +1072,293 @@ fn discoverFiles(
     var out: std.ArrayList(DiscoveredFile) = .empty;
 
     for (roots) |root| {
+        if (root.format == .codex) {
+            try discoverCodex(alloc, &out, root.path, since, cwd_filter);
+            continue;
+        }
         if (is_windows) {
-            try discoverWindows(alloc, &out, root, since, cwd_filter);
+            try discoverWindows(alloc, &out, root.path, since, cwd_filter);
         } else if (is_darwin) {
-            try discoverDarwin(alloc, &out, root, since, cwd_filter);
+            try discoverDarwin(alloc, &out, root.path, since, cwd_filter);
         } else {
-            try discoverLinux(alloc, &out, root, since, cwd_filter);
+            try discoverLinux(alloc, &out, root.path, since, cwd_filter);
         }
     }
     return out.toOwnedSlice(alloc);
+}
+
+const DateDirectory = struct {
+    name: []const u8,
+    path: []const u8,
+};
+
+fn isNumericComponent(name: []const u8, expected_length: usize) bool {
+    if (name.len != expected_length) return false;
+    for (name) |character| {
+        if (character < '0' or character > '9') return false;
+    }
+    return true;
+}
+
+fn discoverCodex(
+    alloc: Allocator,
+    out: *std.ArrayList(DiscoveredFile),
+    root: []const u8,
+    since: ?f64,
+    cwd_filter: ?[]const u8,
+) !void {
+    const years = try listCodexDirectories(alloc, root);
+    for (years) |year| {
+        if (!isNumericComponent(year.name, 4)) continue;
+        const months = try listCodexDirectories(alloc, year.path);
+        for (months) |month| {
+            if (!isNumericComponent(month.name, 2)) continue;
+            const days = try listCodexDirectories(alloc, month.path);
+            for (days) |day| {
+                if (!isNumericComponent(day.name, 2)) continue;
+                const rollouts = try listCodexRollouts(alloc, day.path, since);
+                for (rollouts) |path| {
+                    try appendCodexFile(alloc, out, root, path, cwd_filter);
+                }
+            }
+        }
+    }
+}
+
+fn appendCodexFile(
+    alloc: Allocator,
+    out: *std.ArrayList(DiscoveredFile),
+    root: []const u8,
+    path: []const u8,
+    cwd_filter: ?[]const u8,
+) !void {
+    const data = main.readFirstLine(alloc, path) catch return;
+    const first_line = std.mem.trim(u8, data, " \t\r\n");
+    if (first_line.len == 0) return;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, first_line, .{}) catch return;
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |value| value,
+        else => return,
+    };
+    const entry_type = switch (object.get("type") orelse return) {
+        .string => |value| value,
+        else => return,
+    };
+    if (!std.mem.eql(u8, entry_type, "session_meta")) return;
+    const payload = switch (object.get("payload") orelse return) {
+        .object => |value| value,
+        else => return,
+    };
+    const cwd = switch (payload.get("cwd") orelse return) {
+        .string => |value| value,
+        else => return,
+    };
+    if (cwd_filter) |wanted| {
+        if (!std.mem.eql(u8, wanted, cwd)) return;
+    }
+    const session_value = payload.get("session_id") orelse payload.get("id") orelse return;
+    const session_id = switch (session_value) {
+        .string => |value| value,
+        else => return,
+    };
+    try out.append(alloc, .{
+        .path = path,
+        .slug = try alloc.dupe(u8, cwd),
+        .session_id = try alloc.dupe(u8, session_id),
+        .host_root = root,
+        .format = .codex,
+    });
+}
+
+fn listCodexDirectories(alloc: Allocator, path: []const u8) ![]DateDirectory {
+    if (is_windows) return listCodexDirectoriesWindows(alloc, path);
+    if (is_darwin) return listCodexDirectoriesDarwin(alloc, path);
+    return listCodexDirectoriesLinux(alloc, path);
+}
+
+fn listCodexRollouts(alloc: Allocator, path: []const u8, since: ?f64) ![][]const u8 {
+    if (is_windows) return listCodexRolloutsWindows(alloc, path, since);
+    if (is_darwin) return listCodexRolloutsDarwin(alloc, path, since);
+    return listCodexRolloutsLinux(alloc, path, since);
+}
+
+fn isRolloutName(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, "rollout-") and std.mem.endsWith(u8, name, ".jsonl");
+}
+
+fn listCodexDirectoriesWindows(alloc: Allocator, path: []const u8) ![]DateDirectory {
+    const platform = main.platform;
+    const pattern = try std.fmt.allocPrint(alloc, "{s}\\*", .{path});
+    defer alloc.free(pattern);
+    const wide_pattern = try std.unicode.utf8ToUtf16LeAllocZ(alloc, pattern);
+    defer alloc.free(wide_pattern);
+
+    var result: std.ArrayList(DateDirectory) = .empty;
+    var find_data: platform.WIN32_FIND_DATAW = undefined;
+    const handle = platform.FindFirstFileW(wide_pattern.ptr, &find_data) orelse return &.{};
+    if (handle == platform.INVALID_HANDLE_VALUE) return &.{};
+    defer _ = platform.FindClose(handle);
+
+    while (true) {
+        if ((find_data.dwFileAttributes & platform.FILE_ATTRIBUTE_DIRECTORY) != 0) {
+            const wide_name = std.mem.span(@as([*:0]const u16, @ptrCast(&find_data.cFileName)));
+            const is_dot = wide_name.len == 1 and wide_name[0] == '.';
+            const is_dot_dot = wide_name.len == 2 and wide_name[0] == '.' and wide_name[1] == '.';
+            if (wide_name.len > 0 and !is_dot and !is_dot_dot) {
+                const name = try std.unicode.utf16LeToUtf8Alloc(alloc, wide_name);
+                try result.append(alloc, .{
+                    .name = name,
+                    .path = try std.fmt.allocPrint(alloc, "{s}\\{s}", .{ path, name }),
+                });
+            }
+        }
+        if (platform.FindNextFileW(handle, &find_data) == 0) break;
+    }
+    return result.toOwnedSlice(alloc);
+}
+
+fn listCodexRolloutsWindows(alloc: Allocator, path: []const u8, since: ?f64) ![][]const u8 {
+    const platform = main.platform;
+    const pattern = try std.fmt.allocPrint(alloc, "{s}\\*", .{path});
+    defer alloc.free(pattern);
+    const wide_pattern = try std.unicode.utf8ToUtf16LeAllocZ(alloc, pattern);
+    defer alloc.free(wide_pattern);
+
+    var result: std.ArrayList([]const u8) = .empty;
+    var find_data: platform.WIN32_FIND_DATAW = undefined;
+    const handle = platform.FindFirstFileW(wide_pattern.ptr, &find_data) orelse return &.{};
+    if (handle == platform.INVALID_HANDLE_VALUE) return &.{};
+    defer _ = platform.FindClose(handle);
+
+    while (true) {
+        if ((find_data.dwFileAttributes & platform.FILE_ATTRIBUTE_DIRECTORY) == 0) {
+            const wide_name = std.mem.span(@as([*:0]const u16, @ptrCast(&find_data.cFileName)));
+            const name = try std.unicode.utf16LeToUtf8Alloc(alloc, wide_name);
+            defer alloc.free(name);
+            const mtime_matches = if (since) |cutoff| find_data.ftLastWriteTime.toUnix() >= cutoff else true;
+            if (isRolloutName(name) and mtime_matches) {
+                try result.append(alloc, try std.fmt.allocPrint(alloc, "{s}\\{s}", .{ path, name }));
+            }
+        }
+        if (platform.FindNextFileW(handle, &find_data) == 0) break;
+    }
+    return result.toOwnedSlice(alloc);
+}
+
+fn listCodexDirectoriesDarwin(alloc: Allocator, path: []const u8) ![]DateDirectory {
+    const zero_path = try alloc.dupeZ(u8, path);
+    defer alloc.free(zero_path);
+    const directory = std.c.opendir(zero_path) orelse return &.{};
+    defer _ = std.c.closedir(directory);
+
+    var result: std.ArrayList(DateDirectory) = .empty;
+    while (std.c.readdir(directory)) |entry| {
+        if (entry.type != std.c.DT.DIR) continue;
+        const name_pointer: [*:0]const u8 = @ptrCast(&entry.name);
+        const name = std.mem.span(name_pointer);
+        if (name.len == 0) continue;
+        if (name[0] == '.' and (name.len == 1 or (name.len == 2 and name[1] == '.'))) continue;
+        const owned_name = try alloc.dupe(u8, name);
+        try result.append(alloc, .{
+            .name = owned_name,
+            .path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ path, owned_name }),
+        });
+    }
+    return result.toOwnedSlice(alloc);
+}
+
+fn listCodexRolloutsDarwin(alloc: Allocator, path: []const u8, since: ?f64) ![][]const u8 {
+    const zero_path = try alloc.dupeZ(u8, path);
+    defer alloc.free(zero_path);
+    const directory = std.c.opendir(zero_path) orelse return &.{};
+    defer _ = std.c.closedir(directory);
+
+    var result: std.ArrayList([]const u8) = .empty;
+    while (std.c.readdir(directory)) |entry| {
+        if (entry.type != std.c.DT.REG and entry.type != std.c.DT.UNKNOWN) continue;
+        const name_pointer: [*:0]const u8 = @ptrCast(&entry.name);
+        const name = std.mem.span(name_pointer);
+        if (!isRolloutName(name)) continue;
+        const rollout_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ path, name });
+        if (since) |cutoff| {
+            if (!mtimeOkDarwin(alloc, rollout_path, cutoff)) {
+                alloc.free(rollout_path);
+                continue;
+            }
+        }
+        try result.append(alloc, rollout_path);
+    }
+    return result.toOwnedSlice(alloc);
+}
+
+fn listCodexDirectoriesLinux(alloc: Allocator, path: []const u8) ![]DateDirectory {
+    const linux = main.platform.linux;
+    const zero_path = try alloc.dupeZ(u8, path);
+    defer alloc.free(zero_path);
+    const descriptor: i32 = @bitCast(@as(u32, @truncate(linux.openat(linux.AT.FDCWD, zero_path, .{ .DIRECTORY = true }, 0))));
+    if (descriptor < 0) return &.{};
+    defer _ = linux.close(descriptor);
+
+    var result: std.ArrayList(DateDirectory) = .empty;
+    var directory_buffer: [8192]u8 = undefined;
+    while (true) {
+        const count = linux.getdents64(descriptor, &directory_buffer, directory_buffer.len);
+        const signed_count: isize = @bitCast(count);
+        if (signed_count <= 0) break;
+        var offset: usize = 0;
+        while (offset < count) {
+            const entry = @as(*align(1) const linux.dirent64, @ptrCast(&directory_buffer[offset]));
+            offset += entry.reclen;
+            if (entry.type != linux.DT.DIR) continue;
+            const name_pointer: [*:0]const u8 = @ptrCast(&entry.name);
+            const name = std.mem.span(name_pointer);
+            if (name.len == 0) continue;
+            if (name[0] == '.' and (name.len == 1 or (name.len == 2 and name[1] == '.'))) continue;
+            const owned_name = try alloc.dupe(u8, name);
+            try result.append(alloc, .{
+                .name = owned_name,
+                .path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ path, owned_name }),
+            });
+        }
+    }
+    return result.toOwnedSlice(alloc);
+}
+
+fn listCodexRolloutsLinux(alloc: Allocator, path: []const u8, since: ?f64) ![][]const u8 {
+    const linux = main.platform.linux;
+    const zero_path = try alloc.dupeZ(u8, path);
+    defer alloc.free(zero_path);
+    const descriptor: i32 = @bitCast(@as(u32, @truncate(linux.openat(linux.AT.FDCWD, zero_path, .{ .DIRECTORY = true }, 0))));
+    if (descriptor < 0) return &.{};
+    defer _ = linux.close(descriptor);
+
+    var result: std.ArrayList([]const u8) = .empty;
+    var directory_buffer: [8192]u8 = undefined;
+    while (true) {
+        const count = linux.getdents64(descriptor, &directory_buffer, directory_buffer.len);
+        const signed_count: isize = @bitCast(count);
+        if (signed_count <= 0) break;
+        var offset: usize = 0;
+        while (offset < count) {
+            const entry = @as(*align(1) const linux.dirent64, @ptrCast(&directory_buffer[offset]));
+            offset += entry.reclen;
+            if (entry.type != linux.DT.REG and entry.type != linux.DT.UNKNOWN) continue;
+            const name_pointer: [*:0]const u8 = @ptrCast(&entry.name);
+            const name = std.mem.span(name_pointer);
+            if (!isRolloutName(name)) continue;
+            const rollout_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ path, name });
+            if (since) |cutoff| {
+                if (!mtimeOkLinux(alloc, rollout_path, cutoff)) {
+                    alloc.free(rollout_path);
+                    continue;
+                }
+            }
+            try result.append(alloc, rollout_path);
+        }
+    }
+    return result.toOwnedSlice(alloc);
 }
 
 fn discoverWindows(alloc: Allocator, out: *std.ArrayList(DiscoveredFile), root: []const u8, since: ?f64, cwd_filter: ?[]const u8) !void {
@@ -1517,7 +1857,7 @@ fn processFile(
     pattern: *const Pattern,
     out: *std.ArrayList(Hit),
 ) !void {
-    const msgs = try scanFile(alloc, file.path, args.include_queue_ops);
+    const msgs = try scanFile(alloc, file.path, file.format, args.include_queue_ops);
     for (msgs, 0..) |m, idx| {
         if (!roleMatches(args.role, m.role)) continue;
         if (!args.include_tool_blocks and m.is_only_tool_blocks) continue;
@@ -1659,7 +1999,7 @@ pub fn run(gpa: Allocator, argv: [][]const u8) !void {
     };
     defer pattern.deinit();
 
-    const roots = try walker_roots.resolveRoots(alloc, args.projects_root, args.extra_roots, args.read_config);
+    const roots = try walker_roots.resolveSearchRoots(alloc, args.projects_root, args.extra_roots, args.read_config);
     const files = try discoverFiles(alloc, roots, args.since, args.cwd);
     const files_walked: u64 = files.len;
     const roots_walked: u64 = roots.len;

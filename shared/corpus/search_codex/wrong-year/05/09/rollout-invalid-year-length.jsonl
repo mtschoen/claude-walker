@@ -1,0 +1,2 @@
+{"timestamp": "2026-05-10T11:58:45.000Z", "type": "session_meta", "payload": {"session_id": "invalid-year-length", "cwd": "/worktrees/codex-project"}}
+{"timestamp": "2026-05-10T11:58:55.000Z", "type": "event_msg", "payload": {"type": "agent_message", "message": "codexneedle invalid year length"}}

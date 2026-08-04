@@ -1,6 +1,7 @@
 // Roots discovery: primary root + extras from CLI flags + extras from
-// ~/.claude/walker-roots.json. Deduped via filepath.EvalSymlinks, filtered
-// to existing directories.
+// ~/.claude/walker-roots.json. Search roots carry a Claude Code or Codex
+// format tag; legacy callers continue to receive plain Claude Code paths.
+// Roots are deduped via filepath.EvalSymlinks and filtered to directories.
 //
 // Mirrors cpp/walker_roots.hpp and rust/src/walker_roots.rs. Failure modes
 // follow the SPEC.md contract:
@@ -31,14 +32,40 @@ func WalkerConfigPath() string {
 	return filepath.Join(".claude", "walker-roots.json")
 }
 
+type transcriptFormat string
+
+const (
+	transcriptFormatClaudeCode transcriptFormat = "claude-code"
+	transcriptFormatCodex      transcriptFormat = "codex"
+)
+
+type transcriptRoot struct {
+	Path   string
+	Format transcriptFormat
+}
+
 type walkerConfig struct {
-	ExtraRoots []string `json:"extra_roots"`
+	ExtraRoots []json.RawMessage `json:"extra_roots"`
 }
 
 // ReadExtraRootsFromConfig parses extras from ~/.claude/walker-roots.json.
 // Returns nil on any failure; emits a stderr diagnostic for malformed JSON
 // or wrong-shape (non-object) bodies specifically.
 func ReadExtraRootsFromConfig() []string {
+	tagged := readTaggedExtraRootsFromConfig()
+	if tagged == nil {
+		return nil
+	}
+	extras := make([]string, 0, len(tagged))
+	for _, root := range tagged {
+		if root.Format == transcriptFormatClaudeCode {
+			extras = append(extras, root.Path)
+		}
+	}
+	return extras
+}
+
+func readTaggedExtraRootsFromConfig() []transcriptRoot {
 	configPath := WalkerConfigPath()
 	body, err := os.ReadFile(configPath)
 	if err != nil {
@@ -65,13 +92,87 @@ func ReadExtraRootsFromConfig() []string {
 		fmt.Fprintf(os.Stderr, "walker: malformed %s -- ignoring extra roots\n", configPath)
 		return nil
 	}
-	extras := make([]string, 0, len(cfg.ExtraRoots))
-	for _, p := range cfg.ExtraRoots {
-		if p != "" {
-			extras = append(extras, p)
+	extras := make([]transcriptRoot, 0, len(cfg.ExtraRoots))
+	for _, value := range cfg.ExtraRoots {
+		var path string
+		if err := json.Unmarshal(value, &path); err == nil {
+			if path != "" {
+				extras = append(extras, transcriptRoot{Path: path, Format: transcriptFormatClaudeCode})
+			}
+			continue
+		}
+		var tagged struct {
+			Path   string           `json:"path"`
+			Format transcriptFormat `json:"format"`
+		}
+		if err := json.Unmarshal(value, &tagged); err != nil || tagged.Path == "" {
+			continue
+		}
+		if tagged.Format == transcriptFormatClaudeCode || tagged.Format == transcriptFormatCodex {
+			extras = append(extras, transcriptRoot{Path: tagged.Path, Format: tagged.Format})
 		}
 	}
 	return extras
+}
+
+func defaultCodexRoot() string {
+	if home := homeDirectory(); home != "" {
+		return filepath.Join(home, ".codex", "sessions")
+	}
+	return filepath.Join(".codex", "sessions")
+}
+
+// ResolveSearchRoots preserves the format associated with every search root.
+// CLI extras and string config entries are Claude Code roots. The default
+// Codex sessions root is included only when --projects-root was not explicit.
+func ResolveSearchRoots(primary string, primaryExplicit bool, cliExtras []string, readConfig bool) []transcriptRoot {
+	type candidate struct {
+		root            transcriptRoot
+		diagnoseInvalid bool
+	}
+	combined := []candidate{{
+		root: transcriptRoot{Path: primary, Format: transcriptFormatClaudeCode},
+	}}
+	if !primaryExplicit {
+		combined = append(combined, candidate{
+			root: transcriptRoot{Path: defaultCodexRoot(), Format: transcriptFormatCodex},
+		})
+	}
+	for _, path := range cliExtras {
+		combined = append(combined, candidate{
+			root:            transcriptRoot{Path: path, Format: transcriptFormatClaudeCode},
+			diagnoseInvalid: true,
+		})
+	}
+	if readConfig {
+		for _, root := range readTaggedExtraRootsFromConfig() {
+			combined = append(combined, candidate{root: root, diagnoseInvalid: true})
+		}
+	}
+
+	var result []transcriptRoot
+	seen := make(map[string]struct{})
+	for _, candidate := range combined {
+		canonical, err := filepath.EvalSymlinks(candidate.root.Path)
+		if err != nil {
+			canonical = filepath.Clean(candidate.root.Path)
+		}
+		key := string(candidate.root.Format) + "\x00" + canonical
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		info, err := os.Stat(candidate.root.Path)
+		if err != nil || !info.IsDir() {
+			if candidate.diagnoseInvalid {
+				fmt.Fprintf(os.Stderr,
+					"walker: extra root not a directory, skipping: %s\n", candidate.root.Path)
+			}
+			continue
+		}
+		result = append(result, candidate.root)
+	}
+	return result
 }
 
 // ResolveRoots assembles the effective root list:

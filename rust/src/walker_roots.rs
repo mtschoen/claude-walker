@@ -15,6 +15,18 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::PathBuf;
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum TranscriptFormat {
+    ClaudeCode,
+    Codex,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TranscriptRoot {
+    pub(crate) path: PathBuf,
+    pub(crate) format: TranscriptFormat,
+}
+
 /// Resolve the user's home directory the way every walker subcommand must.
 ///
 /// On Windows, `USERPROFILE` is the canonical home; `HOME` is frequently
@@ -39,6 +51,14 @@ pub fn walker_config_path() -> PathBuf {
 }
 
 pub fn read_extra_roots_from_config() -> Vec<PathBuf> {
+    read_tagged_extra_roots_from_config()
+        .into_iter()
+        .filter(|root| root.format == TranscriptFormat::ClaudeCode)
+        .map(|root| root.path)
+        .collect()
+}
+
+pub(crate) fn read_tagged_extra_roots_from_config() -> Vec<TranscriptRoot> {
     let config = walker_config_path();
     if !config.exists() {
         return Vec::new();
@@ -78,11 +98,85 @@ pub fn read_extra_roots_from_config() -> Vec<PathBuf> {
     for element in array {
         if let Some(s) = element.as_str() {
             if !s.is_empty() {
-                extras.push(PathBuf::from(s));
+                extras.push(TranscriptRoot {
+                    path: PathBuf::from(s),
+                    format: TranscriptFormat::ClaudeCode,
+                });
+            }
+        } else if let Some(tagged) = element.as_object() {
+            let Some(path) = tagged.get("path").and_then(Value::as_str) else {
+                continue;
+            };
+            let format = match tagged.get("format").and_then(Value::as_str) {
+                Some("claude-code") => TranscriptFormat::ClaudeCode,
+                Some("codex") => TranscriptFormat::Codex,
+                _ => continue,
+            };
+            if !path.is_empty() {
+                extras.push(TranscriptRoot {
+                    path: PathBuf::from(path),
+                    format,
+                });
             }
         }
     }
     extras
+}
+
+pub(crate) fn default_codex_root() -> PathBuf {
+    match home_directory() {
+        Some(home) => PathBuf::from(home).join(".codex").join("sessions"),
+        None => PathBuf::from(".codex/sessions"),
+    }
+}
+
+/// Resolve search roots with an explicit format tag. Existing CLI roots and
+/// string config entries remain Claude Code for backward compatibility. When
+/// the primary root is not overridden, the local Codex sessions root is added.
+pub(crate) fn resolve_search_roots(
+    primary: Option<PathBuf>,
+    cli_extras: &[PathBuf],
+    read_config: bool,
+) -> Vec<TranscriptRoot> {
+    let using_defaults = primary.is_none();
+    let mut combined = vec![TranscriptRoot {
+        path: primary.unwrap_or_else(crate::default_projects_root),
+        format: TranscriptFormat::ClaudeCode,
+    }];
+    if using_defaults {
+        combined.push(TranscriptRoot {
+            path: default_codex_root(),
+            format: TranscriptFormat::Codex,
+        });
+    }
+    combined.extend(cli_extras.iter().cloned().map(|path| TranscriptRoot {
+        path,
+        format: TranscriptFormat::ClaudeCode,
+    }));
+    if read_config {
+        combined.extend(read_tagged_extra_roots_from_config());
+    }
+
+    let mut result = Vec::new();
+    let mut seen: HashSet<(TranscriptFormat, String)> = HashSet::new();
+    for (index, root) in combined.into_iter().enumerate() {
+        if !root.path.is_dir() {
+            if index > 0 && root.path.exists() {
+                eprintln!(
+                    "walker: extra root not a directory, skipping: {}",
+                    root.path.display()
+                );
+            }
+            continue;
+        }
+        let key = fs::canonicalize(&root.path)
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| root.path.to_string_lossy().into_owned());
+        if seen.insert((root.format, key)) {
+            result.push(root);
+        }
+    }
+    result
 }
 
 pub fn resolve_roots(primary: PathBuf, cli_extras: &[PathBuf], read_config: bool) -> Vec<PathBuf> {
@@ -244,6 +338,55 @@ mod tests {
             let v = read_extra_roots_from_config();
             assert_eq!(v, vec![PathBuf::from("/tmp/x")]);
         });
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn tagged_config_parses_known_formats_and_skips_malformed_objects() {
+        let tmp = tempdir_path("walker-cfg-tagged");
+        let claude_dir = tmp.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(
+            claude_dir.join("walker-roots.json"),
+            br#"{"extra_roots":[{"format":"codex"},{"path":"/bad","format":"unknown"},{"path":"/claude","format":"claude-code"},{"path":"/codex","format":"codex"}]}"#,
+        )
+        .unwrap();
+        with_home_env(Some(tmp.to_str().unwrap()), None, || {
+            assert_eq!(
+                read_tagged_extra_roots_from_config(),
+                vec![
+                    TranscriptRoot {
+                        path: PathBuf::from("/claude"),
+                        format: TranscriptFormat::ClaudeCode
+                    },
+                    TranscriptRoot {
+                        path: PathBuf::from("/codex"),
+                        format: TranscriptFormat::Codex
+                    },
+                ]
+            );
+        });
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn codex_default_and_non_directory_extra_paths() {
+        with_home_env(None, None, || {
+            assert_eq!(default_codex_root(), PathBuf::from(".codex/sessions"));
+        });
+        let tmp = tempdir_path("walker-search-roots");
+        let primary = tmp.join("primary");
+        fs::create_dir(&primary).unwrap();
+        let not_directory = tmp.join("not-directory");
+        fs::write(&not_directory, b"x").unwrap();
+        let roots = resolve_search_roots(Some(primary.clone()), &[not_directory], false);
+        assert_eq!(
+            roots,
+            vec![TranscriptRoot {
+                path: primary,
+                format: TranscriptFormat::ClaudeCode
+            }]
+        );
         let _ = fs::remove_dir_all(&tmp);
     }
 

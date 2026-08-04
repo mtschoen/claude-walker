@@ -6,10 +6,12 @@
 //     --since/--until (time), --cwd/--any-cwd, --context, --limit,
 //     --count-only, --include-tool-blocks, --format (pretty|jsonl),
 //     --snippet-chars, --projects-root, --now.
-//   - For each jsonl file under --projects-root/<slug>/*.jsonl:
-//     - Scan each line as an assistant entry.
+//   - Resolve format-tagged Claude Code and Codex transcript roots.
+//   - Discover Claude JSONL files by slug and Codex rollout files by date.
+//   - Scan each line using the parser selected by the root format:
 //     - Extract text from message.content (text blocks; tool_use/tool_result
 //       blocks only when --include-tool-blocks).
+//     - Extract Codex user_message and agent_message event payloads.
 //     - Skip entries where content is ONLY tool_use/tool_result blocks
 //       (unless --include-tool-blocks is set).
 //     - Filter by role (--role user|assistant|both).
@@ -29,6 +31,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -153,7 +156,59 @@ type searchMsg struct {
 	IsOnlyToolBlocks bool
 }
 
-func searchScanFile(path string, includeQueueOps, includeToolBlocks bool) []searchMsg {
+type searchRootRecord struct {
+	Type      string          `json:"type"`
+	Message   json.RawMessage `json:"message"`
+	Timestamp string          `json:"timestamp"`
+	Content   json.RawMessage `json:"content"`
+	Payload   json.RawMessage `json:"payload"`
+}
+
+func searchParseCodexEvent(root searchRootRecord, lineNumber uint32) (searchMsg, bool) {
+	if root.Type != "event_msg" || len(root.Payload) == 0 {
+		return searchMsg{}, false
+	}
+	var payload struct {
+		Type    string          `json:"type"`
+		Message json.RawMessage `json:"message"`
+	}
+	if err := sonic.Unmarshal(root.Payload, &payload); err != nil {
+		return searchMsg{}, false
+	}
+	role := ""
+	switch payload.Type {
+	case "user_message":
+		role = "user"
+	case "agent_message":
+		role = "assistant"
+	default:
+		return searchMsg{}, false
+	}
+	var message string
+	if err := sonic.Unmarshal(payload.Message, &message); err != nil {
+		return searchMsg{}, false
+	}
+	var timestamp float64
+	hasTimestamp := false
+	if root.Timestamp != "" {
+		if parsed, ok := parseISO8601(root.Timestamp); ok {
+			timestamp = parsed
+			hasTimestamp = true
+		}
+	}
+	return searchMsg{
+		LineNumber:       lineNumber,
+		Timestamp:        timestamp,
+		HasTimestamp:     hasTimestamp,
+		TimestampStr:     root.Timestamp,
+		Role:             role,
+		TextDefault:      message,
+		TextWithTools:    message,
+		IsOnlyToolBlocks: false,
+	}, true
+}
+
+func searchScanFile(path string, format transcriptFormat, includeQueueOps, includeToolBlocks bool) []searchMsg {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil
@@ -175,13 +230,15 @@ func searchScanFile(path string, includeQueueOps, includeToolBlocks bool) []sear
 		}
 		// One typed root parse instead of a map + per-field re-parses of
 		// type/timestamp. Message/Content stay raw and are decoded lazily.
-		var root struct {
-			Type      string          `json:"type"`
-			Message   json.RawMessage `json:"message"`
-			Timestamp string          `json:"timestamp"`
-			Content   json.RawMessage `json:"content"`
-		}
+		var root searchRootRecord
 		if err := sonic.Unmarshal(line, &root); err != nil {
+			continue
+		}
+		if format == transcriptFormatCodex {
+			message, ok := searchParseCodexEvent(root, uint32(idx))
+			if ok {
+				out = append(out, message)
+			}
 			continue
 		}
 		// Queue-operation entries have no message object: the text lives in a
@@ -261,16 +318,21 @@ type searchFileInfo struct {
 	Slug      string
 	SessionID string
 	HostRoot  string
+	Format    transcriptFormat
 }
 
-func searchDiscoverFiles(roots []string, since *float64, cwdSlug *string) []searchFileInfo {
+func searchDiscoverFiles(roots []transcriptRoot, since *float64, cwdSlug *string) []searchFileInfo {
 	var out []searchFileInfo
 	earliestTime := time.Time{}
 	if since != nil {
 		earliestTime = time.Unix(0, int64(*since*1e9))
 	}
 	for _, root := range roots {
-		entries, err := os.ReadDir(root)
+		if root.Format == transcriptFormatCodex {
+			out = append(out, searchDiscoverCodexFiles(root, since, earliestTime, cwdSlug)...)
+			continue
+		}
+		entries, err := os.ReadDir(root.Path)
 		if err != nil {
 			continue
 		}
@@ -282,7 +344,7 @@ func searchDiscoverFiles(roots []string, since *float64, cwdSlug *string) []sear
 			if cwdSlug != nil && slug != *cwdSlug {
 				continue
 			}
-			slugPath := filepath.Join(root, slug)
+			slugPath := filepath.Join(root.Path, slug)
 			dirEntries, err := os.ReadDir(slugPath)
 			if err != nil {
 				continue
@@ -317,7 +379,8 @@ func searchDiscoverFiles(roots []string, since *float64, cwdSlug *string) []sear
 							Path:      filepath.Join(subDir, name),
 							Slug:      slug,
 							SessionID: sid,
-							HostRoot:  root,
+							HostRoot:  root.Path,
+							Format:    transcriptFormatClaudeCode,
 						})
 					}
 					continue
@@ -335,13 +398,119 @@ func searchDiscoverFiles(roots []string, since *float64, cwdSlug *string) []sear
 					Path:      filepath.Join(slugPath, fEnt.Name()),
 					Slug:      slug,
 					SessionID: strings.TrimSuffix(fEnt.Name(), ".jsonl"),
-					HostRoot:  root,
+					HostRoot:  root.Path,
+					Format:    transcriptFormatClaudeCode,
 				}
 				out = append(out, df)
 			}
 		}
 	}
 	return out
+}
+
+func searchDiscoverCodexFiles(root transcriptRoot, since *float64, earliestTime time.Time, cwdFilter *string) []searchFileInfo {
+	var out []searchFileInfo
+	years := searchReadDirectoryEntries(root.Path)
+	for _, year := range years {
+		if !year.IsDir() || !searchIsNumericComponent(year.Name(), 4) {
+			continue
+		}
+		months := searchReadDirectoryEntries(filepath.Join(root.Path, year.Name()))
+		for _, month := range months {
+			if !month.IsDir() || !searchIsNumericComponent(month.Name(), 2) {
+				continue
+			}
+			monthPath := filepath.Join(root.Path, year.Name(), month.Name())
+			days := searchReadDirectoryEntries(monthPath)
+			for _, day := range days {
+				if !day.IsDir() || !searchIsNumericComponent(day.Name(), 2) {
+					continue
+				}
+				dayPath := filepath.Join(monthPath, day.Name())
+				rollouts := searchReadDirectoryEntries(dayPath)
+				for _, rollout := range rollouts {
+					name := rollout.Name()
+					if rollout.IsDir() || !strings.HasPrefix(name, "rollout-") || !strings.HasSuffix(name, ".jsonl") {
+						continue
+					}
+					if since != nil {
+						info, err := rollout.Info()
+						if err == nil && info.ModTime().Before(earliestTime) {
+							continue
+						}
+					}
+					path := filepath.Join(dayPath, name)
+					body := searchReadFirstLine(path)
+					if len(body) == 0 {
+						continue
+					}
+					var metadata struct {
+						Type    string `json:"type"`
+						Payload struct {
+							SessionID string `json:"session_id"`
+							ID        string `json:"id"`
+							Cwd       string `json:"cwd"`
+						} `json:"payload"`
+					}
+					if err := sonic.Unmarshal(body, &metadata); err != nil || metadata.Type != "session_meta" || metadata.Payload.Cwd == "" {
+						continue
+					}
+					if cwdFilter != nil && metadata.Payload.Cwd != *cwdFilter {
+						continue
+					}
+					sessionID := metadata.Payload.SessionID
+					if sessionID == "" {
+						sessionID = metadata.Payload.ID
+					}
+					if sessionID == "" {
+						continue
+					}
+					out = append(out, searchFileInfo{
+						Path:      path,
+						Slug:      metadata.Payload.Cwd,
+						SessionID: sessionID,
+						HostRoot:  root.Path,
+						Format:    transcriptFormatCodex,
+					})
+				}
+			}
+		}
+	}
+	return out
+}
+
+func searchIsNumericComponent(name string, expectedLength int) bool {
+	if len(name) != expectedLength {
+		return false
+	}
+	for _, character := range name {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func searchReadFirstLine(path string) []byte {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer file.Close()
+	return searchReadFirstLineFrom(file)
+}
+
+func searchReadFirstLineFrom(reader io.Reader) []byte {
+	line, _ := bufio.NewReader(reader).ReadBytes('\n')
+	return line
+}
+
+func searchReadDirectoryEntries(path string) []os.DirEntry {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return nil
+	}
+	return entries
 }
 
 // === Snippet ===
@@ -462,25 +631,26 @@ type searchHit struct {
 // === Args ===
 
 type searchArgs struct {
-	Pattern            string
-	Regex              bool
-	CaseSensitive      bool
-	Role               string
-	Since              *float64
-	Until              *float64
-	Cwd                string
-	AnyCwd             bool
-	Context            uint32
-	Limit              uint32
-	CountOnly          bool
-	IncludeToolBlocks  bool
-	IncludeQueueOps    bool
-	Format             string
-	SnippetChars       uint32
-	ProjectsRoot       string
-	ExtraProjectsRoots []string
-	ReadConfig         bool
-	Now                float64
+	Pattern              string
+	Regex                bool
+	CaseSensitive        bool
+	Role                 string
+	Since                *float64
+	Until                *float64
+	Cwd                  string
+	AnyCwd               bool
+	Context              uint32
+	Limit                uint32
+	CountOnly            bool
+	IncludeToolBlocks    bool
+	IncludeQueueOps      bool
+	Format               string
+	SnippetChars         uint32
+	ProjectsRoot         string
+	ProjectsRootExplicit bool
+	ExtraProjectsRoots   []string
+	ReadConfig           bool
+	Now                  float64
 }
 
 func parseSearchArgs(raw []string) (searchArgs, error) {
@@ -582,6 +752,7 @@ func parseSearchArgs(raw []string) (searchArgs, error) {
 			}
 			i++
 			args.ProjectsRoot = raw[i]
+			args.ProjectsRootExplicit = true
 		case "--extra-projects-root":
 			if i+1 >= len(raw) {
 				return args, fmt.Errorf("--extra-projects-root needs a value")
@@ -779,7 +950,7 @@ func asciiScanFold(text string, lowerPat []byte) (asciiOnly, found bool) {
 // === File processing ===
 
 func searchProcessFile(f searchFileInfo, args searchArgs, matcher searchMatcher) []searchHit {
-	msgs := searchScanFile(f.Path, args.IncludeQueueOps, args.IncludeToolBlocks)
+	msgs := searchScanFile(f.Path, f.Format, args.IncludeQueueOps, args.IncludeToolBlocks)
 	var hits []searchHit
 
 	for idx, m := range msgs {
@@ -937,7 +1108,7 @@ func runSearch(argv []string) {
 	matcher := newSearchMatcher(re, args)
 
 	// Resolve roots (primary + CLI extras + config extras).
-	roots := ResolveRoots(args.ProjectsRoot, args.ExtraProjectsRoots, args.ReadConfig)
+	roots := ResolveSearchRoots(args.ProjectsRoot, args.ProjectsRootExplicit, args.ExtraProjectsRoots, args.ReadConfig)
 	rootsWalked := uint64(len(roots))
 
 	// Discover files

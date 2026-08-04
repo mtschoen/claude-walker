@@ -52,10 +52,11 @@ provenance so results are not mistaken for one linear conversation.
 
 ### 3. Codex CLI
 
-Treat `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl` as canonical and include
-`archived_sessions` on request. Use SQLite/index files only to enrich metadata;
-rollout files remain discoverable when indexes drift. Parse incrementally
-because individual rollouts can be very large.
+Native `walker search` discovers `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`
+and reads searchable user and agent events directly from the rollout stream.
+This phase tracks MCP-level Codex aggregation, honoring `$CODEX_HOME` and
+including `archived_sessions` on request. Use SQLite/index files only to enrich
+metadata; rollout files remain discoverable when indexes drift.
 
 ### 4. Hermes Agent
 

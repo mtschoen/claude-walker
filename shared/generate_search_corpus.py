@@ -26,6 +26,7 @@ from typing import Sequence
 ROOT = Path(__file__).resolve().parent
 CORPUS_SEARCH = ROOT / "corpus" / "search"
 CORPUS_SEARCH_MULTI_ROOT = ROOT / "corpus" / "search_multi_root"
+CORPUS_SEARCH_CODEX = ROOT / "corpus" / "search_codex"
 
 NOW_UNIX = 1778414400.0  # 2026-05-09 12:00:00 UTC -- matches beacon corpus
 
@@ -79,6 +80,24 @@ def user_bare_string(unix_ts: float, text: str) -> dict:
             "role": "user",
             "content": text,
         },
+    }
+
+
+def codex_session_meta(unix_ts: float, session_id: str, cwd: str) -> dict:
+    """Codex rollout metadata. `id` is accepted as a legacy alias by walkers."""
+    return {
+        "timestamp": iso(unix_ts),
+        "type": "session_meta",
+        "payload": {"session_id": session_id, "cwd": cwd},
+    }
+
+
+def codex_event(unix_ts: float, event_type: str, message: object) -> dict:
+    """Codex event_msg record; non-string messages exercise lenient parsing."""
+    return {
+        "timestamp": iso(unix_ts),
+        "type": "event_msg",
+        "payload": {"type": event_type, "message": message},
     }
 
 
@@ -2132,6 +2151,110 @@ def main() -> None:
     print(f"  under {CORPUS_SEARCH}")
     print(f"Wrote {mr_files} JSONL fixtures across {len(MULTI_ROOT_SCENARIOS)} multi-root scenarios")
     print(f"  under {CORPUS_SEARCH_MULTI_ROOT}")
+
+    if CORPUS_SEARCH_CODEX.exists():
+        for p in sorted(CORPUS_SEARCH_CODEX.rglob("*"), reverse=True):
+            if p.is_file():
+                p.unlink()
+            elif p.is_dir():
+                p.rmdir()
+        CORPUS_SEARCH_CODEX.rmdir()
+
+    codex_cwd = "/worktrees/codex-project"
+    other_cwd = "/worktrees/other-project"
+    session_id = "019fb6bc-1111-7222-8333-444444444444"
+    other_session_id = "019fb6bc-aaaa-7bbb-8ccc-dddddddddddd"
+    codex_files = {
+        "2026/05/09/rollout-2026-05-09T11-00-00-"
+        f"{session_id}.jsonl": [
+            codex_session_meta(NOW_UNIX - 3600, session_id, codex_cwd),
+            codex_event(NOW_UNIX - 3500, "user_message", "codexneedle from user"),
+            codex_event(NOW_UNIX - 3400, "token_count", "codexneedle ignored"),
+            codex_event(NOW_UNIX - 3300, "agent_message", "codexneedle from agent"),
+            codex_event(NOW_UNIX - 3200, "agent_message", {"not": "text"}),
+            {"timestamp": iso(NOW_UNIX - 3100), "type": "event_msg"},
+        ],
+        "2026/05/09/rollout-2026-05-09T10-00-00-"
+        f"{other_session_id}.jsonl": [
+            {"timestamp": iso(NOW_UNIX - 7200), "type": "session_meta",
+             "payload": {"id": other_session_id, "cwd": other_cwd}},
+            codex_event(NOW_UNIX - 7100, "agent_message", "codexneedle other cwd"),
+        ],
+        "2026/05/09/not-a-rollout.jsonl": [
+            codex_session_meta(NOW_UNIX - 100, "ignored", codex_cwd),
+            codex_event(NOW_UNIX - 90, "agent_message", "codexneedle ignored filename"),
+        ],
+        "2026/05/09/rollout-empty.jsonl": [],
+        "2026/05/09/rollout-invalid-utf8.jsonl": [b"\xff"],
+        "2026/05/09/rollout-malformed.jsonl": ["{bad json"],
+        "2026/05/09/rollout-wrong-type.jsonl": [{"type": "event_msg"}],
+        "2026/05/09/rollout-no-payload.jsonl": [{"type": "session_meta"}],
+        "2026/05/09/rollout-no-cwd.jsonl": [
+            {"type": "session_meta", "payload": {"session_id": "no-cwd"}}
+        ],
+        "2026/05/09/rollout-no-session-id.jsonl": [
+            {"type": "session_meta", "payload": {"cwd": codex_cwd}}
+        ],
+        "20x6/05/09/rollout-invalid-year.jsonl": [
+            codex_session_meta(NOW_UNIX - 80, "invalid-year", codex_cwd),
+            codex_event(NOW_UNIX - 70, "agent_message", "codexneedle invalid year"),
+        ],
+        "wrong-year/05/09/rollout-invalid-year-length.jsonl": [
+            codex_session_meta(NOW_UNIX - 75, "invalid-year-length", codex_cwd),
+            codex_event(
+                NOW_UNIX - 65, "agent_message", "codexneedle invalid year length"
+            ),
+        ],
+        "2026/0x/09/rollout-invalid-month.jsonl": [
+            codex_session_meta(NOW_UNIX - 60, "invalid-month", codex_cwd),
+            codex_event(NOW_UNIX - 50, "agent_message", "codexneedle invalid month"),
+        ],
+        "2026/05/0x/rollout-invalid-day.jsonl": [
+            codex_session_meta(NOW_UNIX - 40, "invalid-day", codex_cwd),
+            codex_event(NOW_UNIX - 30, "agent_message", "codexneedle invalid day"),
+        ],
+    }
+    for rel, lines in codex_files.items():
+        write_jsonl(CORPUS_SEARCH_CODEX / rel, lines)
+
+    def codex_hit(session: str, cwd: str, line: int, timestamp: float,
+                  role: str, text: str) -> dict:
+        start = text.index("codexneedle")
+        return hit(
+            session_id=session, cwd_slug=cwd, line_number=line,
+            timestamp=iso(timestamp), role=role, snippet=text,
+            match_offsets=[[start, start + len("codexneedle")]],
+        )
+
+    codex_expected = {
+        "_meta": meta,
+        "pattern": "codexneedle",
+        "cwd": codex_cwd,
+        "all": {
+            "hits": [
+                codex_hit(session_id, codex_cwd, 4, NOW_UNIX - 3300,
+                          "assistant", "codexneedle from agent"),
+                codex_hit(session_id, codex_cwd, 2, NOW_UNIX - 3500,
+                          "user", "codexneedle from user"),
+                codex_hit(other_session_id, other_cwd, 2, NOW_UNIX - 7100,
+                          "assistant", "codexneedle other cwd"),
+            ],
+            "summary": summary(hits=3, sessions_matched=2, roots_walked=2),
+        },
+        "cwd_filtered": {
+            "hits": [
+                codex_hit(session_id, codex_cwd, 4, NOW_UNIX - 3300,
+                          "assistant", "codexneedle from agent"),
+                codex_hit(session_id, codex_cwd, 2, NOW_UNIX - 3500,
+                          "user", "codexneedle from user"),
+            ],
+            "summary": summary(hits=2, sessions_matched=1, roots_walked=2),
+        },
+    }
+    (CORPUS_SEARCH_CODEX / "expected.json").write_text(
+        json.dumps(codex_expected, indent=2) + "\n", encoding="utf-8"
+    )
+    print(f"Wrote codex rollout fixtures under {CORPUS_SEARCH_CODEX}")
 
 
 if __name__ == "__main__":

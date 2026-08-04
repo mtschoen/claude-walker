@@ -21,7 +21,7 @@ OpenCode discovery uses `~/.local/share/opencode/opencode.db`. Override it with
 the tool's `opencode_db` parameter or `AGENT_WALKER_OPENCODE_DB`. The provider
 opens SQLite read-only and validates the `session`, `message`, and `part`
 columns it consumes. See [`docs/provider-roadmap.md`](docs/provider-roadmap.md)
-for the Pi, Codex, Hermes, and Agy phases.
+for the Pi, Hermes, Agy, and MCP-level Codex aggregation phases.
 
 OpenCode search currently supports literal substring matching. For `regex=true`,
 the generic tool still searches Claude with its native RE2 engine and reports
@@ -29,10 +29,11 @@ OpenCode as unavailable rather than substituting Python's potentially
 backtracking regex engine.
 
 The walker reads a configurable set of project roots (default
-`~/.claude/projects` plus any extras listed in `~/.claude/walker-roots.json`),
-so the same subscription used from multiple machines can be aggregated by
-the host that has filesystem access to all of them. See "Multi-host setup"
-below and the `## Roots` section in [`SPEC.md`](SPEC.md).
+`~/.claude/projects` plus any extras listed in `~/.claude/walker-roots.json`).
+Search also includes `~/.codex/sessions` by default and accepts tagged Codex
+roots in that config, so the same subscription used from multiple machines can
+be aggregated by the host that has filesystem access to all of them. See
+"Multi-host setup" below and the `## Roots` section in [`SPEC.md`](SPEC.md).
 
 Drop-in optional speedup for [schoen-claude-status](https://github.com/mtschoen/schoen-claude-status)
 (the Python statusline does this in ~250ms with an `orjson` +
@@ -52,7 +53,11 @@ path via `~/.claude/walker-roots.json`:
 ```json
 {
   "extra_roots": [
-    "/mnt/other-host/Users/mtsch/.claude/projects"
+    "/mnt/other-host/Users/mtsch/.claude/projects",
+    {
+      "path": "/mnt/other-host/Users/mtsch/.codex/sessions",
+      "format": "codex"
+    }
   ]
 }
 ```

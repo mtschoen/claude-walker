@@ -244,6 +244,7 @@ struct LiteralPrefilter {
 // also use text_default — so text_with_tools is never read and we skip
 // the extra content-array traversal it would cost.
 static std::vector<ScanMessage> scanFile(const fs::path &path,
+                                         TranscriptFormat transcript_format,
                                          bool extract_with_tools,
                                          bool include_queue_ops,
                                          const LiteralPrefilter *prefilter) {
@@ -292,6 +293,47 @@ static std::vector<ScanMessage> scanFile(const fs::path &path,
     simdjson::dom::element doc;
     if (parser.parse(view).get(doc) != simdjson::SUCCESS)
       continue;
+    if (transcript_format == TranscriptFormat::Codex) {
+      std::string_view doc_type;
+      if (doc["type"].get_string().get(doc_type) != simdjson::SUCCESS ||
+          doc_type != "event_msg")
+        continue;
+      simdjson::dom::object payload;
+      if (doc["payload"].get_object().get(payload) != simdjson::SUCCESS)
+        continue;
+      std::string_view payload_type;
+      if (payload["type"].get_string().get(payload_type) != simdjson::SUCCESS)
+        continue;
+      std::string role;
+      if (payload_type == "user_message")
+        role = "user";
+      else if (payload_type == "agent_message")
+        role = "assistant";
+      else
+        continue;
+      std::string_view message;
+      if (payload["message"].get_string().get(message) != simdjson::SUCCESS)
+        continue;
+      std::string_view timestamp;
+      if (doc["timestamp"].get_string().get(timestamp) != simdjson::SUCCESS)
+        timestamp = "";
+
+      ScanMessage codex_message;
+      codex_message.line_number = idx;
+      codex_message.role = std::move(role);
+      codex_message.text_default = std::string(message);
+      codex_message.text_with_tools = codex_message.text_default;
+      if (!timestamp.empty()) {
+        codex_message.timestamp_str = std::string(timestamp);
+        auto parsed_timestamp = parse_iso8601(codex_message.timestamp_str);
+        if (parsed_timestamp) {
+          codex_message.timestamp = *parsed_timestamp;
+          codex_message.has_timestamp = true;
+        }
+      }
+      out.push_back(std::move(codex_message));
+      continue;
+    }
     // Queue-operation entries have no `message` object: the text lives in a
     // root-level `content` string. Only indexed when --include-queue-ops is
     // set; content-bearing enqueue/popAll surface, empty remove/dequeue are
@@ -367,18 +409,113 @@ struct DiscoveredFile {
   std::string slug;
   std::string session_id;
   std::string host_root; // the effective root this file was discovered under
+  TranscriptFormat format = TranscriptFormat::ClaudeCode;
 };
+
+static bool isNumericDateComponent(const fs::path &path,
+                                   std::size_t expected_length) {
+  const std::string name = path.filename().string();
+  return name.size() == expected_length &&
+         std::all_of(name.begin(), name.end(),
+                     [](unsigned char character) {
+                       return character >= '0' && character <= '9';
+                     });
+}
 
 // Shared fused walk (discovery.hpp): parents + subagents in one pass per
 // slug dir, per-call error_codes, and the same mtime conversion as every
 // other mode (the old local mtimeAtOrAfter used fractional seconds while
 // common.hpp truncates - a latent cross-mode divergence, now gone).
-static std::vector<DiscoveredFile> discoverFiles(const fs::path &root,
+static std::vector<DiscoveredFile>
+discoverCodexFiles(const TranscriptRoot &root, std::optional<double> since,
+                   const std::string *cwd_filter) {
+  std::vector<DiscoveredFile> out;
+  std::error_code year_iterator_error;
+  for (const auto &year :
+       fs::directory_iterator(root.path, year_iterator_error)) {
+    std::error_code year_type_error;
+    if (!year.is_directory(year_type_error) ||
+        !isNumericDateComponent(year.path(), 4))
+      continue;
+    std::error_code month_iterator_error;
+    for (const auto &month :
+         fs::directory_iterator(year.path(), month_iterator_error)) {
+      std::error_code month_type_error;
+      if (!month.is_directory(month_type_error) ||
+          !isNumericDateComponent(month.path(), 2))
+        continue;
+      std::error_code day_iterator_error;
+      for (const auto &day :
+           fs::directory_iterator(month.path(), day_iterator_error)) {
+        std::error_code day_type_error;
+        if (!day.is_directory(day_type_error) ||
+            !isNumericDateComponent(day.path(), 2))
+          continue;
+        std::error_code rollout_iterator_error;
+        for (const auto &rollout :
+             fs::directory_iterator(day.path(), rollout_iterator_error)) {
+          std::error_code rollout_type_error;
+          if (!rollout.is_regular_file(rollout_type_error))
+            continue;
+          std::string name = rollout.path().filename().string();
+          if (name.size() < 14 || name.compare(0, 8, "rollout-") != 0 ||
+              name.compare(name.size() - 6, 6, ".jsonl") != 0)
+            continue;
+          if (since && walker::entry_mtime_before(rollout, *since))
+            continue;
+
+          std::ifstream input(rollout.path());
+          std::string first_line;
+          if (!input || !std::getline(input, first_line) || first_line.empty())
+            continue;
+          simdjson::dom::parser parser;
+          simdjson::padded_string padded(first_line);
+          simdjson::dom::element metadata;
+          if (parser.parse(padded).get(metadata) != simdjson::SUCCESS)
+            continue;
+          std::string_view metadata_type;
+          if (metadata["type"].get_string().get(metadata_type) !=
+                  simdjson::SUCCESS ||
+              metadata_type != "session_meta")
+            continue;
+          simdjson::dom::object payload;
+          if (metadata["payload"].get_object().get(payload) !=
+              simdjson::SUCCESS)
+            continue;
+          std::string_view cwd;
+          if (payload["cwd"].get_string().get(cwd) != simdjson::SUCCESS)
+            continue;
+          if (cwd_filter && cwd != *cwd_filter)
+            continue;
+          std::string_view session_id;
+          if (payload["session_id"].get_string().get(session_id) !=
+                  simdjson::SUCCESS &&
+              payload["id"].get_string().get(session_id) != simdjson::SUCCESS)
+            continue;
+
+          DiscoveredFile discovered;
+          discovered.path = rollout.path();
+          discovered.slug = std::string(cwd);
+          discovered.session_id = std::string(session_id);
+          discovered.host_root = root.path.string();
+          discovered.format = TranscriptFormat::Codex;
+          out.push_back(std::move(discovered));
+        }
+      }
+    }
+  }
+  return out;
+}
+
+static std::vector<DiscoveredFile> discoverFiles(const TranscriptRoot &root,
                                                  std::optional<double> since,
                                                  const std::string *cwd_slug) {
+  if (root.format == TranscriptFormat::Codex)
+    return discoverCodexFiles(root, since, cwd_slug);
+
   std::vector<DiscoveredFile> out;
   walker::for_each_transcript(
-      std::vector<fs::path>{root}, cwd_slug,
+      std::vector<fs::path>{root.path}, cwd_slug,
       [&](const fs::path &, const std::string &slug, const std::string &sid,
           const fs::directory_entry &entry) {
         if (since && walker::entry_mtime_before(entry, *since))
@@ -387,7 +524,8 @@ static std::vector<DiscoveredFile> discoverFiles(const fs::path &root,
         df.path = entry.path();
         df.slug = slug;
         df.session_id = sid;
-        df.host_root = root.string();
+        df.host_root = root.path.string();
+        df.format = TranscriptFormat::ClaudeCode;
         out.push_back(std::move(df));
       });
   return out;
@@ -518,7 +656,7 @@ struct Args {
   bool include_queue_ops = false;
   std::string format = "pretty";
   uint32_t snippet_chars = 240;
-  fs::path projects_root;
+  std::optional<fs::path> projects_root;
   std::vector<fs::path> extra_projects_roots;
   bool read_config = true;
   double now = 0;
@@ -624,7 +762,7 @@ static Args parseArgs(const std::vector<std::string> &raw) {
     } else if (s == "--projects-root") {
       if (++i >= raw.size())
         throw std::runtime_error("--projects-root needs a value");
-      args.projects_root = raw[i];
+      args.projects_root = fs::path(raw[i]);
     } else if (s == "--now") {
       if (++i >= raw.size())
         throw std::runtime_error("--now needs a value");
@@ -654,8 +792,6 @@ static Args parseArgs(const std::vector<std::string> &raw) {
   // here).
   if (!args.cwd.empty() && args.any_cwd)
     throw std::runtime_error("--cwd and --any-cwd are mutually exclusive");
-  args.projects_root =
-      args.projects_root.empty() ? default_projects_root() : args.projects_root;
   args.now = now_override.value_or(current_unix());
   if (since_raw)
     args.since = parseTimeArg(*since_raw, args.now);
@@ -775,7 +911,7 @@ struct Matcher {
 
 static std::vector<Hit> processFile(const DiscoveredFile &f, const Args &args,
                                     const Matcher &matcher) {
-  auto messages = scanFile(f.path, args.include_tool_blocks,
+  auto messages = scanFile(f.path, f.format, args.include_tool_blocks,
                            args.include_queue_ops, &matcher.prefilter);
   std::vector<Hit> hits;
   for (size_t idx = 0; idx < messages.size(); ++idx) {
@@ -940,7 +1076,7 @@ int run(const std::vector<std::string> &argv) {
   // root it came from as host_root. Mirrors events.cpp / search.rs; the
   // perf-pass-2 search rewrite dropped this multi-root resolution.
   std::string *cwd_slug_ptr = args.cwd.empty() ? nullptr : &args.cwd;
-  std::vector<fs::path> roots = walker::resolve_roots(
+  std::vector<TranscriptRoot> roots = walker::resolve_search_roots(
       args.projects_root, args.extra_projects_roots, args.read_config);
   std::vector<DiscoveredFile> files;
   for (const auto &root : roots) {
