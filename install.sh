@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Build the C++ walker (production impl) and install it as `claude-walker`
-# at ~/.local/bin, then register the search MCP server. Smoke test before
-# reporting success.
+# Build the C++ walker (production impl) and install it as `agent-walker`
+# at ~/.local/bin (with a `claude-walker` copy kept as a back-compat alias
+# for existing callers), then register the search MCP server. Smoke test
+# before reporting success.
 #
 # Usage: install.sh [--project [DIR]]
 #   (no flag)        register the MCP server at `user` scope (global, every project)
@@ -99,12 +100,17 @@ if [[ -z "$walker_bin" ]]; then
 fi
 
 mkdir -p "$HOME/.local/bin"
-target="$HOME/.local/bin/claude-walker"
+target="$HOME/.local/bin/agent-walker"
+alias_target="$HOME/.local/bin/claude-walker"
 case "$walker_bin" in
-    *.exe) target="$target.exe" ;;
+    *.exe) target="$target.exe"; alias_target="$alias_target.exe" ;;
 esac
 cp "$walker_bin" "$target"
-echo "installed $walker_bin -> $target"
+# claude-walker is a deprecated back-compat alias for existing callers
+# (progress-beacon hooks, statusline lookups). Remove once every consumer
+# has migrated to the agent-walker name.
+cp "$walker_bin" "$alias_target"
+echo "installed $walker_bin -> $target (alias: $alias_target)"
 
 # Smoke test: bare-flag invocation routes to cost mode.
 if "$target" --period 86400 --win-start 0 >/dev/null; then
@@ -114,10 +120,10 @@ else
     exit 1
 fi
 
-if ! command -v claude-walker >/dev/null 2>&1; then
+if ! command -v agent-walker >/dev/null 2>&1; then
     echo
     echo "Note: $HOME/.local/bin is not on PATH. Add it before the recency-nudge"
-    echo "hook or status line can find claude-walker by name."
+    echo "hook or status line can find agent-walker (or its claude-walker alias) by name."
 fi
 
 # --- Register the search MCP server -----------------------------------------

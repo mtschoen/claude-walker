@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Coverage orchestrator for claude-walker's four implementations.
+"""Coverage orchestrator for agent-walker's four implementations.
 
 Builds each implementation in an *instrumented* mode, drives the existing
 ``conformance.py`` harness against the instrumented binary (so every walker
@@ -537,7 +537,7 @@ def write_report(results: list[Result]) -> None:
     total_tests = sum(r.conformance_passed for r in results)
 
     lines: list[str] = []
-    lines.append(f"claude-walker test report — {ts}")
+    lines.append(f"agent-walker test report — {ts}")
     lines.append("=" * 60)
     lines.append("")
     lines.append(f"Status:       {'PASS' if all_100 else 'BASELINE'} "

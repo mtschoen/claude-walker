@@ -1,8 +1,9 @@
 """MCP server for provider-aware historical agent-session search.
 
-Claude Code search remains delegated to the native claude-walker binary.
-Provider modules handle stores with different formats, beginning with
-OpenCode's SQLite database. Cost, event, and beacon modes remain Claude-only.
+Claude Code search remains delegated to the native agent-walker binary
+(installed as `claude-walker` as a back-compat alias). Provider modules
+handle stores with different formats, beginning with OpenCode's SQLite
+database. Cost, event, and beacon modes remain Claude-only.
 
 Launched by absolute path (`python <repo>/mcp/server.py`) rather than
 `python -m mcp` — the directory is named `mcp/` to match the spec, but `-m mcp`
@@ -127,26 +128,31 @@ def _instrument_tool(
 def _binary_candidates() -> list[Path]:
     """Discovery chain, first existing wins (per SPEC.md MCP shim section).
 
-    1. $CLAUDE_WALKER_BINARY (exact path).
-    2. ~/.claude/walker[.exe]
-    3. ~/.local/bin/claude-walker[.exe]
-    4. PATH lookup for claude-walker / walker.
+    1. $AGENT_WALKER_BINARY (exact path).
+    2. $CLAUDE_WALKER_BINARY (exact path; back-compat alias for #1).
+    3. ~/.claude/walker[.exe]
+    4. ~/.local/bin/agent-walker[.exe]
+    5. ~/.local/bin/claude-walker[.exe] (back-compat alias)
+    6. PATH lookup for agent-walker / claude-walker / walker.
     """
     candidates: list[Path] = []
 
-    override = os.environ.get("CLAUDE_WALKER_BINARY")
+    override = os.environ.get("AGENT_WALKER_BINARY") or os.environ.get(
+        "CLAUDE_WALKER_BINARY"
+    )
     if override:
         candidates.append(Path(override))
 
     home = Path.home()
     for directory, stem in (
         (home / ".claude", "walker"),
+        (home / ".local" / "bin", "agent-walker"),
         (home / ".local" / "bin", "claude-walker"),
     ):
         candidates.append(directory / f"{stem}.exe")
         candidates.append(directory / stem)
 
-    for name in ("claude-walker", "walker"):
+    for name in ("agent-walker", "claude-walker", "walker"):
         found = shutil.which(name)
         if found:
             candidates.append(Path(found))
@@ -159,9 +165,10 @@ def _resolve_binary() -> Path:
         if candidate.is_file():
             return candidate
     raise RuntimeError(
-        "claude-walker binary not found. Install it (run install.sh / install.bat in the "
-        "claude-walker repo), or set CLAUDE_WALKER_BINARY to its path. Looked in "
-        "$CLAUDE_WALKER_BINARY, ~/.claude/, ~/.local/bin/, and PATH."
+        "agent-walker binary not found. Install it (run install.sh / install.bat in the "
+        "agent-walker repo), or set AGENT_WALKER_BINARY (or the legacy CLAUDE_WALKER_BINARY) "
+        "to its path. Looked in $AGENT_WALKER_BINARY, $CLAUDE_WALKER_BINARY, ~/.claude/, "
+        "~/.local/bin/, and PATH."
     )
 
 
