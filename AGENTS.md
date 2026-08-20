@@ -272,21 +272,42 @@ but does not fail the binary install. The installer manages a dedicated
 venv at `mcp/.venv` (gitignored) to host the `mcp` SDK: it picks the
 newest Python ≥3.10 available (`python3.13` → `3.12` → `3.11` → `3.10`,
 falling back to `python3`/`python`; on Windows uses the `py` launcher),
-creates the venv if missing, runs `pip install --upgrade mcp` into it
-(idempotent), and registers the server with the venv's interpreter as an
-absolute path. This sidesteps both PEP 668 (modern macOS/Linux pythons
+creates the venv if missing, runs `pip install --upgrade "mcp~=2.0"` into
+it (idempotent), and registers the server with the venv's interpreter as
+an absolute path. This sidesteps both PEP 668 (modern macOS/Linux pythons
 refuse system-wide pip) and the trap that bare `python` may not exist on
 PATH for processes Claude Code spawns (shell aliases don't propagate).
 Re-running is idempotent: the prior registration in that scope is
 removed first, and an existing venv is reused.
 
+The SDK spec is **pinned to the 2.x line**, and the reuse check probes
+whether the venv's interpreter actually *runs* rather than merely existing.
+Both guard failure modes that took the server down silently:
+
+- `server.py` targets the v2 API (`mcp.server.MCPServer`). An unpinned
+  `--upgrade` crosses the 1.x -> 2.x boundary on its own, and 2.0 removed
+  `mcp.server.fastmcp` outright, so the server starts failing at import
+  with no signal until the next connect attempt.
+- A venv whose base Python was uninstalled or relocated still has its
+  `python` stub on disk, but that stub resolves `home` out of `pyvenv.cfg`
+  and dies at startup. An `exists`-only check treats it as healthy and
+  skips the repair forever. Re-running `-m venv` over the directory
+  rewrites `pyvenv.cfg` and the launcher while leaving `site-packages`
+  intact, so the repair is cheap and non-destructive.
+
 ## Remotes
 
-`origin` → Gitea (`gitea@llamabox.sticktoitive.net:schoen/agent-walker.git`)
-is the only configured remote since the move into schoen-lab/satellites.
-The old GitHub mirror (`mtschoen/claude-walker`) is not configured in this
-clone. Always `git remote -v` before pushing - see
-`~/.claude/notes/reference_repo_remote_names.md`.
+This clone has **three** remotes, and `origin` is GitHub, not Gitea:
+
+| Remote | URL |
+| --- | --- |
+| `origin` | `git@github.com:mtschoen/agent-walker.git` |
+| `github.com` | `git@github.com:mtschoen/agent-walker.git` (same as `origin`) |
+| `gitea` | `gitea@llamabox:schoen/agent-walker.git` |
+
+`main` tracks **`github.com/main`**, so a bare `git push` goes to GitHub.
+Pushing to Gitea is explicit: `git push gitea main`. Always `git remote -v`
+before pushing - see `~/.claude/notes/reference_repo_remote_names.md`.
 
 ## Quality gate: aislop
 

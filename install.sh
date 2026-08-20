@@ -156,8 +156,17 @@ pick_python() {
 }
 
 ensure_venv() {
-    if [[ -x "$venv_py" ]]; then
+    # A venv is reusable only if its interpreter actually RUNS. Testing for the
+    # file alone is not enough: a venv whose base Python was uninstalled or
+    # relocated still has bin/python, but it resolves `home` out of pyvenv.cfg
+    # and dies at startup. Re-running `-m venv` over the existing directory
+    # rewrites pyvenv.cfg and the launcher while leaving site-packages intact,
+    # so falling through to the create step repairs in place.
+    if [[ -x "$venv_py" ]] && "$venv_py" -c 'pass' >/dev/null 2>&1; then
         return 0
+    fi
+    if [[ -e "$venv_py" ]]; then
+        echo "venv at $venv_dir has a dead base interpreter; repairing in place"
     fi
     local py
     if ! py=$(pick_python); then
@@ -178,7 +187,12 @@ else
     venv_ready=0
     if ensure_venv; then
         # Idempotent: pip install is fast when the wheel is already cached.
-        if "$venv_py" -m pip install --quiet --upgrade mcp; then
+        # Pinned to the 2.x line on purpose. server.py targets the v2 API
+        # (`mcp.server.MCPServer`); an unpinned --upgrade silently crossed the
+        # 1.x -> 2.x boundary, which removed `mcp.server.fastmcp` and left the
+        # server failing at import with no signal until the next connect
+        # attempt. Bump deliberately when porting to 3.x.
+        if "$venv_py" -m pip install --quiet --upgrade 'mcp~=2.0'; then
             venv_ready=1
         else
             echo "warning: failed to install 'mcp' SDK into $venv_dir" >&2

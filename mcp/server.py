@@ -8,8 +8,8 @@ database. Cost, event, and beacon modes remain Claude-only.
 Launched by absolute path (`python <repo>/mcp/server.py`) rather than
 `python -m mcp` — the directory is named `mcp/` to match the spec, but `-m mcp`
 would collide with the `mcp` SDK package on sys.path. Running by script path
-puts only this directory on sys.path[0], so `import mcp.server.fastmcp`
-resolves to the installed SDK, not this folder.
+puts only this directory on sys.path[0], so `import mcp.server` resolves to the
+installed SDK, not this folder.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ _SHARED_DIR = Path(__file__).resolve().parent.parent / "shared"
 if str(_SHARED_DIR) not in sys.path:
     sys.path.insert(0, str(_SHARED_DIR))
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 from opencode_search import (
     OpenCodeSearchError,
     SearchOptions,
@@ -82,7 +82,7 @@ def _instrument_tool(
 ) -> Callable[..., Any]:
     """Bracket each tool call with call/return/error log entries.
 
-    `functools.wraps` keeps `inspect.signature` (which FastMCP uses to derive
+    `functools.wraps` keeps `inspect.signature` (which MCPServer uses to derive
     the parameter schema) following `__wrapped__` back to the original.
     """
     tool_name = function.__name__
@@ -178,7 +178,7 @@ def _run_search(arguments: list[str]) -> dict[str, Any]:
     Returns {"hits": [...], "summary": {...} | None, "note": str | None}.
     `note` carries the walker's stderr (e.g. the truncation hint) on success.
     Raises RuntimeError on a non-zero exit (bad pattern / regex / time / flag)
-    or a subprocess timeout — FastMCP surfaces it as an MCP tool error.
+    or a subprocess timeout - MCPServer surfaces it as an MCP tool error.
 
     Shells out via process_safe.run_captured rather than bare subprocess.run:
     this is the live MCP server behind agent_walker_search, so a wedged
@@ -394,9 +394,9 @@ def _run_agent_search(
     return merged
 
 
-def create_mcp_server() -> FastMCP:
+def create_mcp_server() -> MCPServer:
     """Create and return the configured agent-walker MCP server."""
-    server = FastMCP(
+    server = MCPServer(
         "agent-walker",
         instructions=(
             "Search past coding-agent sessions. Use agent_walker_search when the user "

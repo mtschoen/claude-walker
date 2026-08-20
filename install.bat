@@ -100,7 +100,13 @@ call :ensure_venv
 set "VENV_READY=!errorlevel!"
 if "!VENV_READY!"=="0" (
     REM Idempotent: pip install is fast when the wheel is already cached.
-    "%VENV_PY%" -m pip install --quiet --upgrade mcp
+    REM Pinned to the 2.x line on purpose. server.py targets the v2 API
+    REM (`mcp.server.MCPServer`); an unpinned --upgrade silently crossed the
+    REM 1.x -> 2.x boundary, which removed `mcp.server.fastmcp` and left the
+    REM server failing at import with no signal until the next connect attempt.
+    REM `~=2.0` (rather than >=2,<3) also keeps the spec free of cmd's
+    REM redirection characters. Bump deliberately when porting to 3.x.
+    "%VENV_PY%" -m pip install --quiet --upgrade "mcp~=2.0"
     if errorlevel 1 (
         echo warning: failed to install 'mcp' SDK into %VENV_DIR%
         set "VENV_READY=1"
@@ -137,9 +143,18 @@ if /I "%MCP_SCOPE%"=="local" (
 goto :eof
 
 :ensure_venv
-REM If the venv already exists, no work to do (pip upgrade runs unconditionally
-REM in the caller, so a stale venv self-heals as long as its python is usable).
-if exist "%VENV_PY%" exit /b 0
+REM A venv is reusable only if its interpreter actually RUNS. `if exist` alone is
+REM not enough: a venv whose base Python was uninstalled or relocated still has
+REM Scripts\python.exe, but that stub resolves `home` out of pyvenv.cfg and dies
+REM with "did not find executable at ...". Re-running `-m venv` over the existing
+REM directory rewrites pyvenv.cfg and the launcher stubs while leaving
+REM site-packages intact, so falling through to the create step repairs in place.
+REM `if errorlevel` (unlike %ERRORLEVEL%) reads the live code inside a block.
+if exist "%VENV_PY%" (
+    "%VENV_PY%" -c "pass" >nul 2>&1
+    if not errorlevel 1 exit /b 0
+    echo venv at %VENV_DIR% has a dead base interpreter; repairing in place
+)
 REM Find Python >=3.10 (the `mcp` SDK's floor). The `py` launcher (PEP 397) is
 REM the canonical Windows tool for picking a specific version. Try newest first.
 set "PY_LAUNCHER="
