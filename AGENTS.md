@@ -249,12 +249,18 @@ are documented inline in `cpp/main.cpp`.
 ## Install
 
 `bash install.sh` (Linux/git-bash) or `install.bat` (cmd) builds the
-C++ impl and copies the binary as `agent-walker(.exe)` to `~/.local/bin/`,
+walker and copies the binary as `agent-walker(.exe)` to `~/.local/bin/`,
 with a second copy installed as `claude-walker(.exe)` — a deprecated
 back-compat alias for callers that still look it up by the old name
 (progress-beacon hooks, statusline binary discovery). The script
 smoke-tests the primary `agent-walker` binary's bare-flag cost-mode
 invocation before exiting and warns if `~/.local/bin` isn't on PATH.
+
+Both scripts build whichever impl the host has a toolchain for: C++ (the
+production binary) is tried first, then Go, then Rust, which are
+conformance-equal fallbacks for hosts with no C++ toolchain. A host needs
+exactly one of cmake + a C++ compiler, `go`, or `cargo` + a linker; when
+none is present the script reports that and exits non-zero.
 
 It also registers the `search` MCP server (`mcp/server.py`) via
 `claude mcp add`:

@@ -1,5 +1,5 @@
 @echo off
-REM Build the C++ walker and install as agent-walker.exe at %USERPROFILE%\.local\bin
+REM Build the walker and install as agent-walker.exe at %USERPROFILE%\.local\bin
 REM (with a claude-walker.exe copy kept as a back-compat alias for existing
 REM callers), then register the search MCP server.
 REM
@@ -37,20 +37,23 @@ if /I "%MCP_SCOPE%"=="local" if not defined PROJECT_DIR set "PROJECT_DIR=%INVOCA
 
 pushd "%~dp0"
 
-cmake -S cpp -B cpp\build -DCMAKE_BUILD_TYPE=Release || goto :error
-cmake --build cpp\build --config Release -j || goto :error
-
+REM Build whichever impl this host has a toolchain for. C++ is the production
+REM binary and is tried first; Go and Rust are conformance-equal fallbacks for
+REM hosts without a C++ toolchain. This is the Windows counterpart of
+REM install.sh's build_cpp/build_go/build_rust chain. Each :build_* routine sets
+REM WALKER_BIN on success and leaves it empty when its toolchain is absent or
+REM its build fails, so the caller falls through to the next impl.
 set "WALKER_BIN="
-for %%f in (cpp\build\Release\walker.exe cpp\build\walker.exe) do (
-    if exist "%%f" (
-        set "WALKER_BIN=%%f"
-        goto :found
-    )
+set "BUILT_VIA="
+call :build_cpp
+if not defined WALKER_BIN call :build_go
+if not defined WALKER_BIN call :build_rust
+if not defined WALKER_BIN (
+    echo install.bat: no usable toolchain to build the walker.
+    echo              install one of: cmake + a C++ compiler, or go, or cargo + a linker.
+    goto :error
 )
-echo install.bat: built walker.exe not found under cpp\build\
-goto :error
-
-:found
+echo built walker via %BUILT_VIA%: %WALKER_BIN%
 set "INSTALL_DIR=%USERPROFILE%\.local\bin"
 if not exist "%INSTALL_DIR%" mkdir "%INSTALL_DIR%"
 copy /Y "%WALKER_BIN%" "%INSTALL_DIR%\agent-walker.exe" >nul || goto :error
@@ -209,3 +212,54 @@ exit /b 1
 popd
 endlocal
 exit /b 1
+
+REM ---------------------------------------------------------------------------
+REM Builders. Each is called with no arguments, probes for its toolchain, and on
+REM success sets WALKER_BIN (path to the built exe) and BUILT_VIA (impl name).
+REM A missing toolchain or a failed build is deliberately NOT fatal here: the
+REM routine returns with WALKER_BIN unset so the caller can try the next impl.
+REM Only the caller, once every impl has been tried, treats that as an error.
+
+:build_cpp
+where cmake >nul 2>&1 || goto :eof
+cmake -S cpp -B cpp\build -DCMAKE_BUILD_TYPE=Release || goto :eof
+cmake --build cpp\build --config Release -j || goto :eof
+for %%f in (cpp\build\Release\walker.exe cpp\build\walker.exe) do (
+    if exist "%%f" (
+        set "WALKER_BIN=%%f"
+        set "BUILT_VIA=cpp"
+        goto :eof
+    )
+)
+echo install.bat: cmake reported success but no walker.exe exists under cpp\build\
+goto :eof
+
+:build_go
+where go >nul 2>&1 || goto :eof
+REM CGO off so the pure-Go linker is used -- no system C compiler required.
+pushd go
+set "CGO_ENABLED=0"
+go build -o walker.exe .
+set "GO_RC=%ERRORLEVEL%"
+popd
+if not "%GO_RC%"=="0" goto :eof
+if exist "go\walker.exe" (
+    set "WALKER_BIN=go\walker.exe"
+    set "BUILT_VIA=go"
+)
+goto :eof
+
+:build_rust
+where cargo >nul 2>&1 || goto :eof
+REM rustc shells out to a system linker (MSVC link.exe, or gcc under MinGW). If
+REM none is installed cargo fails here and we fall through with WALKER_BIN unset.
+pushd rust
+cargo build --release
+set "RUST_RC=%ERRORLEVEL%"
+popd
+if not "%RUST_RC%"=="0" goto :eof
+if exist "rust\target\release\walker.exe" (
+    set "WALKER_BIN=rust\target\release\walker.exe"
+    set "BUILT_VIA=rust"
+)
+goto :eof
